@@ -1,0 +1,15 @@
+# hampi-translate do-not-translate list: one term per line.
+# Names, rig models, places and club names pass through exactly as written.
+# Callsigns, Q-codes, signal reports, grid squares and frequencies are
+# already protected automatically.
+Baofeng
+Yaesu
+Icom
+Kenwood
+Elecraft
+Xiegu
+Digirig
+SignaLink
+POTA
+SOTA
+RF Pi

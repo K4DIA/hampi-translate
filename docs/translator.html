@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Offline Radio Translator</title>
+<meta name="description" content="An offline Raspberry Pi voice translator for phone-mode amateur radio: speak English, transmit any of 29 languages, no internet. Concept by W4DPE.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+/* Layout: an equipment datasheet. A model block up top, then spec sections
+   down one column, with flow steps on a timeline rail. Amber = radio display,
+   teal = receive path. */
+:root {
+  --paper: #f4f6f3;
+  --panel: #ffffff;
+  --ink: #172026;
+  --muted: #56636c;
+  --rule: #d3d9d5;
+  --amber: #a85400;
+  --amber-soft: #fbe8d0;
+  --rx: #1d6a85;
+  --rx-soft: #dceef4;
+  --good: #2f7a3e;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --script: system-ui, "Noto Sans", "Noto Sans Arabic", "Noto Sans Devanagari", "Noto Sans JP", "Noto Sans SC", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0f1417; --panel: #161d21; --ink: #e5ebe9; --muted: #9aa7ae; --rule: #2b353b;
+    --amber: #f0a03c; --amber-soft: #3a2914; --rx: #63b9d6; --rx-soft: #12303b; --good: #6cc27d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0f1417; --panel: #161d21; --ink: #e5ebe9; --muted: #9aa7ae; --rule: #2b353b;
+  --amber: #f0a03c; --amber-soft: #3a2914; --rx: #63b9d6; --rx-soft: #12303b; --good: #6cc27d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 16px/1.55 var(--body);
+  padding-inline: 16px; padding-block: 0 64px;
+}
+.sheet { max-width: 1040px; margin: 0 auto; display: grid; gap: 56px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.15; }
+h2 { font-size: 1.6rem; font-weight: 600; }
+h3 { font-size: 1.1rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.lead { color: var(--muted); }
+.mono { font-family: var(--mono); }
+.label {
+  font: 600 0.72rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--muted);
+}
+section { display: grid; gap: 20px; }
+section > header { display: grid; gap: 8px; border-top: 2px solid var(--ink); padding-top: 14px; }
+a { color: var(--amber); }
+:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+/* ---- model block ---- */
+.masthead {
+  display: grid; gap: 28px; padding-block: 40px 8px;
+  border-bottom: 1px solid var(--rule);
+}
+.model-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 24px; align-items: baseline; }
+.model-no { font: 600 0.85rem/1 var(--mono); letter-spacing: 0.08em; color: var(--muted); }
+.status {
+  display: inline-flex; gap: 8px; align-items: center;
+  font: 600 0.78rem/1 var(--mono); padding: 7px 10px; border-radius: 3px;
+  background: var(--amber-soft); color: var(--ink);
+}
+.status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+h1 { font-size: clamp(2.4rem, 7vw, 4.4rem); font-weight: 700; letter-spacing: -0.01em; }
+.tagline { font-size: 1.2rem; max-width: 52ch; }
+.credit { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+.credit .call {
+  font: 600 1rem/1 var(--mono); border: 1.5px solid var(--ink); padding: 5px 8px; border-radius: 2px;
+}
+.specs {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  border: 1px solid var(--rule); background: var(--panel);
+}
+.spec { padding: 16px 18px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); min-width: 0; }
+.spec b { display: block; font: 600 1.9rem/1.1 var(--display); font-variant-numeric: tabular-nums; margin-top: 6px; }
+.spec span { color: var(--muted); font-size: 0.9rem; }
+
+/* ---- flow ---- */
+.flow { list-style: none; margin: 0; padding: 0; display: grid; }
+.step {
+  display: grid; grid-template-columns: 92px 28px minmax(0, 1fr); column-gap: 14px;
+  align-items: start;
+}
+.when { font: 600 0.78rem/1.3 var(--mono); color: var(--muted); text-align: right; padding-top: 14px; font-variant-numeric: tabular-nums; }
+.rail { position: relative; align-self: stretch; }
+.rail::before { content: ""; position: absolute; left: 13px; top: 0; bottom: 0; width: 2px; background: var(--rule); }
+.step:first-child .rail::before { top: 18px; }
+.step:last-child .rail::before { bottom: calc(100% - 18px); }
+.dot {
+  position: relative; display: grid; place-items: center; width: 28px; height: 28px; margin-top: 8px;
+  border-radius: 50%; background: var(--panel); border: 2px solid var(--ink);
+  font: 600 0.75rem/1 var(--mono);
+}
+.step.radio .dot { background: var(--amber); border-color: var(--amber); color: var(--panel); }
+.step.rx .dot { border-color: var(--rx); color: var(--rx); }
+.body { padding: 8px 0 20px; display: grid; gap: 4px; min-width: 0; }
+.where {
+  justify-self: start; font: 600 0.68rem/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 4px 6px; border-radius: 2px; border: 1px solid var(--rule); color: var(--muted);
+}
+.step.radio .where { border-color: var(--amber); color: var(--amber); }
+.step.rx .where { border-color: var(--rx); color: var(--rx); }
+.body p { color: var(--muted); font-size: 0.95rem; }
+.body strong { font-weight: 600; color: var(--ink); }
+.tool { font-family: var(--mono); font-size: 0.95em; color: var(--ink); }
+.flows { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 32px 40px; }
+.flow-title { display: flex; gap: 10px; align-items: baseline; margin-bottom: 8px; }
+.flow-title .label { color: var(--amber); }
+.flows > div:last-child .flow-title .label { color: var(--rx); }
+
+/* ---- what they hear ---- */
+.onair {
+  background: var(--panel); border: 1px solid var(--rule); border-left: 4px solid var(--amber);
+  padding: 18px 20px; display: grid; gap: 10px;
+}
+.onair ol { margin: 0; padding-left: 1.3em; display: grid; gap: 6px; }
+.onair .it { font-family: var(--mono); font-size: 0.95rem; }
+.onair .gloss { color: var(--muted); font-size: 0.88rem; display: block; }
+
+/* ---- hookup ---- */
+.hookup { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0; }
+.dev {
+  flex: 1 1 150px; min-width: 0; background: var(--panel); border: 1.5px solid var(--ink);
+  border-radius: 4px; padding: 14px; display: grid; gap: 4px; align-content: start;
+}
+.dev.pi { border-color: var(--amber); box-shadow: inset 0 0 0 1px var(--amber); }
+.dev small { color: var(--muted); font-size: 0.85rem; line-height: 1.4; }
+.wire {
+  flex: 0 0 74px; display: grid; place-items: center; align-content: center; gap: 2px;
+  font: 600 0.7rem/1.2 var(--mono); color: var(--muted); text-align: center;
+}
+.wire::before { content: ""; width: 100%; height: 2px; background: var(--ink); }
+.extra { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 10px 24px; color: var(--muted); font-size: 0.92rem; }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.94rem; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--rule); }
+th { font: 600 0.72rem/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); }
+.none-built {
+  display: inline-flex; gap: 8px; align-items: center; font-weight: 600;
+  color: var(--good);
+}
+.none-built::before { content: "✓"; font-family: var(--mono); }
+
+/* ---- languages ---- */
+.lang-tools { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; }
+.lang-tools input {
+  font: inherit; padding: 8px 10px; border: 1px solid var(--rule); border-radius: 3px;
+  background: var(--panel); color: var(--ink); min-width: 0; width: min(280px, 100%);
+}
+.langs { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(165px, 100%), 1fr)); gap: 10px; }
+.lang {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 3px; padding: 12px 14px;
+  display: grid; gap: 6px; align-content: start; min-width: 0;
+}
+.lang-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.lang .native { font: 600 1.1rem/1.2 var(--script); }
+.lang .code { font: 600 0.75rem/1 var(--mono); color: var(--muted); }
+.lang .en { font-size: 0.82rem; color: var(--muted); }
+.lang .disc { font: 0.85rem/1.4 var(--script); border-top: 1px dashed var(--rule); padding-top: 6px; overflow-wrap: anywhere; }
+.lang .engine { font: 600 0.68rem/1 var(--mono); letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; }
+.lang.home { border-color: var(--ink); }
+.lang.jtalk { border-color: var(--rx); }
+.lang.jtalk .engine { color: var(--rx); }
+.lang[hidden] { display: none; }
+.note { color: var(--muted); font-size: 0.9rem; max-width: 80ch; }
+
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.rule-card { border-top: 3px solid var(--ink); padding-top: 10px; display: grid; gap: 4px; }
+.rule-card p { color: var(--muted); font-size: 0.93rem; }
+
+.estimate { border: 1px dashed var(--amber); background: var(--amber-soft); padding: 10px 14px; font-size: 0.92rem; max-width: 80ch; }
+
+.milestones { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.milestones li { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; }
+.box {
+  width: 18px; height: 18px; border: 1.5px solid var(--ink); border-radius: 2px; margin-top: 3px;
+  display: grid; place-items: center; font: 600 0.8rem/1 var(--mono);
+}
+.done .box { background: var(--ink); color: var(--paper); }
+.milestones p { color: var(--muted); font-size: 0.92rem; }
+
+footer { border-top: 1px solid var(--rule); padding-top: 16px; color: var(--muted); font-size: 0.88rem; display: grid; gap: 6px; }
+
+@media (max-width: 760px) {
+  .flows { grid-template-columns: minmax(0, 1fr); }
+  .step { grid-template-columns: 64px 28px minmax(0, 1fr); column-gap: 10px; }
+  .hookup { flex-direction: column; }
+  .wire { flex-basis: 44px; grid-auto-flow: column; gap: 10px; justify-content: start; padding-left: 24px; }
+  .wire::before { width: 2px; height: 32px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .lang { transition: border-color 0.15s; }
+  .lang:hover { border-color: var(--amber); }
+}
+</style>
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+</head>
+<body>
+
+<main class="sheet">
+
+  <header class="masthead">
+    <div class="model-row">
+      <span class="model-no">PHONE-MODE ACCESSORY · TX/RX TRANSLATOR · PROTOTYPE</span>
+      <span class="status">Working prototype · Pi bench test next</span>
+    </div>
+    <div style="display:grid;gap:14px">
+      <h1>Offline Radio Translator</h1>
+      <p class="tagline">Speak English into a headset. A Raspberry Pi transmits it in Italian, Japanese or 27 other languages, and translates the reply into your headphones. No internet, no cloud, no phone held up to a mic.</p>
+    </div>
+    <div class="credit">
+      <span class="label">Concept by</span>
+      <span>David P. Eisenhardt, Jr.</span>
+      <span class="call">W4DPE</span>
+    </div>
+    <div class="specs" role="list">
+      <div class="spec" role="listitem"><span>Languages</span><b>English + 29</b><span>translated both ways</span></div>
+      <div class="spec" role="listitem"><span>Internet needed</span><b>Once</b><span>to install; never on the air</span></div>
+      <div class="spec" role="listitem"><span>Power</span><b>~3–11.5 W</b><span>Raspberry Pi idle to full load</span></div>
+      <div class="spec" role="listitem"><span>Wait per 10 s over</span><b>5–12 s</b><span>Pi 4, estimated · 3–8 s Pi 5</span></div>
+      <div class="spec" role="listitem"><span>Custom hardware</span><b>None</b><span>all off-the-shelf parts</span></div>
+    </div>
+  </header>
+
+  <section aria-labelledby="flow-h">
+    <header>
+      <span class="label">Signal flow</span>
+      <h2 id="flow-h">What happens from the moment you press PTT</h2>
+      <p class="lead">Phone-mode radio is half-duplex: you talk, say "over", and the other station waits. So the box never has to translate while you speak. It records the whole over, translates it, then keys up. The processing time looks like a slow "over". Times on the left are Pi 4 estimates.</p>
+    </header>
+
+    <div class="flows">
+      <div>
+        <div class="flow-title"><span class="label">Transmit</span><h3>You → the other station</h3></div>
+        <ol class="flow">
+          <li class="step"><span class="when">0 s</span><span class="rail"><span class="dot">1</span></span>
+            <div class="body"><span class="where">You</span><strong>Press PTT</strong><p>Hold the footswitch, or press Enter. This only tells the Pi to listen; the radio is not keyed.</p></div></li>
+          <li class="step"><span class="when">talking</span><span class="rail"><span class="dot">2</span></span>
+            <div class="body"><span class="where">You</span><strong>Speak English into the headset</strong><p>"Good morning K1ABC, you're five nine, thanks for the contact."</p></div></li>
+          <li class="step"><span class="when">release</span><span class="rail"><span class="dot">3</span></span>
+            <div class="body"><span class="where">You</span><strong>Release PTT</strong><p>Let go of the footswitch, or press Enter again. Recording stops (45 s limit).</p></div></li>
+          <li class="step"><span class="when">+3–7 s</span><span class="rail"><span class="dot">4</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Speech to text</strong><p><span class="tool">whisper.cpp</span> turns your voice into English text, on the Pi.</p></div></li>
+          <li class="step"><span class="when"></span><span class="rail"><span class="dot">5</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Jargon guard</strong><p>Callsigns, signal reports, Q-codes, grids and frequencies are set aside so the translator can't change them.</p></div></li>
+          <li class="step"><span class="when">+0.5–2 s</span><span class="rail"><span class="dot">6</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Translate</strong><p><span class="tool">Argos Translate</span> language pack, English → Italian. The jargon is put back exactly.</p></div></li>
+          <li class="step"><span class="when">+1.5–3 s</span><span class="rail"><span class="dot">7</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Synthesized voice</strong><p><span class="tool">Piper</span> (or <span class="tool">Open JTalk</span> for Japanese) speaks the Italian. Callsigns come out in phonetics.</p></div></li>
+          <li class="step"><span class="when">your call</span><span class="rail"><span class="dot">8</span></span>
+            <div class="body"><span class="where">You</span><strong>Review, then press again to send</strong><p>The screen shows what you said and what will go out. Press Enter to transmit. Anything else, or no answer in 20 s, discards it.</p></div></li>
+          <li class="step radio"><span class="when">keyed</span><span class="rail"><span class="dot">9</span></span>
+            <div class="body"><span class="where">Radio</span><strong>Pi keys the transmitter</strong><p>CAT command through <span class="tool">rigctld</span>, the interface's RTS line, or VOX.</p></div></li>
+          <li class="step radio"><span class="when">on air</span><span class="rail"><span class="dot">10</span></span>
+            <div class="body"><span class="where">Radio</span><strong>Disclosure, message, station ID</strong><p>"Trasmissione tradotta automaticamente." then the Italian, then your call in English when an ID is due. A long message is cut to fit 90 s; the ID never is.</p></div></li>
+          <li class="step radio"><span class="when">≤ 90 s</span><span class="rail"><span class="dot">11</span></span>
+            <div class="body"><span class="where">Radio</span><strong>Unkey</strong><p>Always: after an error, if the program is killed, or if the sound device stalls (a watchdog unkeys).</p></div></li>
+        </ol>
+      </div>
+
+      <div>
+        <div class="flow-title"><span class="label">Receive</span><h3>The other station → you</h3></div>
+        <ol class="flow">
+          <li class="step rx"><span class="when">they talk</span><span class="rail"><span class="dot">1</span></span>
+            <div class="body"><span class="where">Radio</span><strong>Their Italian comes in</strong><p>Audio from the rig into the USB interface.</p></div></li>
+          <li class="step rx"><span class="when">silence</span><span class="rail"><span class="dot">2</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Find the over</strong><p>Signal level marks where they start and stop. Bursts of noise are ignored.</p></div></li>
+          <li class="step rx"><span class="when"></span><span class="rail"><span class="dot">3</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Speech to text, in Italian</strong><p>Known Whisper noise phrases are filtered out.</p></div></li>
+          <li class="step rx"><span class="when"></span><span class="rail"><span class="dot">4</span></span>
+            <div class="body"><span class="where">Pi</span><strong>Translate Italian → English</strong><p>Same jargon guard on the way back.</p></div></li>
+          <li class="step rx"><span class="when">a few s</span><span class="rail"><span class="dot">5</span></span>
+            <div class="body"><span class="where">You</span><strong>English in your headphones</strong><p>The screen shows their original words beside the translation.</p></div></li>
+        </ol>
+        <p class="note" style="margin-top:8px">Receive is muted while you transmit, so the Pi never translates its own signal.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="air-h">
+    <header>
+      <span class="label">On the air</span>
+      <h2 id="air-h">What the other station hears</h2>
+    </header>
+    <div class="onair">
+      <span class="label">One over, as transmitted</span>
+      <ol>
+        <li><span class="it">Trasmissione tradotta automaticamente.</span><span class="gloss">"Machine-translated transmission." Said first, in their language, on every over.</span></li>
+        <li><span class="it">Buongiorno Kilo 1 Alfa Bravo Charlie, sei 5 9, grazie per il collegamento.</span><span class="gloss">Your message. The callsign and signal report came through translation untouched.</span></li>
+        <li><span class="it">This is Whiskey 4 Delta Papa Echo.</span><span class="gloss">English ID (FCC §97.119): added to the end of your first over, and to any over that would otherwise end more than 10 minutes after the last ID. A recording of your own voice works too.</span></li>
+      </ol>
+    </div>
+    <p class="note">The other station needs nothing special. They hear a synthetic Italian voice and reply normally.</p>
+  </section>
+
+  <section aria-labelledby="hw-h">
+    <header>
+      <span class="label">Hookup</span>
+      <h2 id="hw-h">Hardware: all off the shelf</h2>
+      <p class="lead"><span class="none-built">Nothing to build.</span> The Pi has no microphone input (and a Pi 5 has no headphone jack), so audio goes through USB on both sides.</p>
+    </header>
+    <div>
+      <div class="hookup" aria-label="Headset to Raspberry Pi to USB radio interface to radio">
+        <div class="dev"><span class="label">You</span><strong>USB headset</strong><small>Mic in, translated receive audio out. Headphones keep that audio out of the mic.</small></div>
+        <div class="wire">USB</div>
+        <div class="dev pi"><span class="label">The box</span><strong>Raspberry Pi 4 or 5</strong><small>Runs speech recognition, translation and the voice. 4 GB+ RAM, fan, 64-bit OS.</small></div>
+        <div class="wire">USB</div>
+        <div class="dev"><span class="label">Interface</span><strong>USB radio interface</strong><small>Digirig, SignaLink or a CM108 card. Audio both ways, plus PTT.</small></div>
+        <div class="wire">radio cable</div>
+        <div class="dev"><span class="label">Rig</span><strong>Your radio</strong><small>Data port or mic jack. CAT over USB if the rig has it.</small></div>
+      </div>
+      <div class="extra">
+        <span><strong>Local PTT:</strong> keyboard Enter (press to start, press to stop), or a switch from GPIO27 (pin 13) to ground (pin 14) that you hold while talking.</span>
+        <span><strong>Screen:</strong> a monitor or touchscreen showing the terminal, or SSH from a laptop. There is no web interface yet.</span>
+        <span><strong>Shortcut:</strong> a rig with built-in USB audio and CAT (an IC-7300, for example) replaces the interface.</span>
+      </div>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Part</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Raspberry Pi 4B or Pi 5, 4 GB or more</td><td>The pipeline uses about 1–1.5 GB of RAM</td></tr>
+          <tr><td>Cooling</td><td>Fan case on a Pi 4, Active Cooler on a Pi 5</td></tr>
+          <tr><td>32 GB+ microSD or USB SSD</td><td>Engines plus one language pair: under 1 GB</td></tr>
+          <tr><td>USB headset</td><td>Or a USB sound card plus any headset</td></tr>
+          <tr><td>USB radio interface + radio cable</td><td>Digirig, SignaLink or CM108; cable to suit the rig</td></tr>
+          <tr><td>12 V → 5 V buck converter</td><td>3 A for a Pi 4, 5 A for a Pi 5; or a USB-C power bank</td></tr>
+          <tr><td>Footswitch (optional)</td><td>Any momentary switch, or a USB footswitch</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">The one case that needs a small circuit: keying the radio directly from a Pi GPIO pin needs a transistor or opto-isolator board. CAT, the Digirig's RTS line or VOX avoid it.</p>
+  </section>
+
+  <section aria-labelledby="lang-h">
+    <header>
+      <span class="label">Languages</span>
+      <h2 id="lang-h">English plus 29 languages, both directions</h2>
+      <p class="lead">Each one has a translation pack in both directions with English, Whisper speech recognition, an offline voice, and its own spoken disclosure line (shown on each card).</p>
+    </header>
+    <div class="lang-tools">
+      <label for="lang-filter" class="label">Find a language</label>
+      <input id="lang-filter" type="search" placeholder="Japanese, 日本語, ja…" autocomplete="off">
+    </div>
+    <div class="langs" id="langs"></div>
+    <p class="note">Japanese uses Open JTalk because Piper has no Japanese voice. Callsign phonetics are spoken in katakana (キロ 1 アルファ…), since Open JTalk would otherwise spell "Kilo" letter by letter. The disclosure lines were written for this tool; a native speaker should check them before they go on the air. Argos also has Korean, Thai, Hebrew and Indonesian packs, but no offline voice exists for them yet.</p>
+  </section>
+
+  <section aria-labelledby="jargon-h">
+    <header>
+      <span class="label">Jargon guard</span>
+      <h2 id="jargon-h">Ham radio terms never reach the translator</h2>
+      <p class="lead">They are swapped out before translation and put back exactly. A bare number only counts as a report after words like "you're" or "signal", so "I'm 59" and "59 watts" stay numbers.</p>
+    </header>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>You say</th><th>Screen shows</th><th>Voice says</th></tr></thead>
+        <tbody>
+          <tr><td>K1ABC, or "kilo one alfa bravo charlie"</td><td class="mono">K1ABC</td><td>Kilo 1 Alfa Bravo Charlie</td></tr>
+          <tr><td>"five nine", "5 by 9", "you're 59"</td><td class="mono">5 9</td><td>5 9, in the voice's language</td></tr>
+          <tr><td>QTH, QSL, QRZ?, CQ</td><td class="mono">QTH</td><td>Q T H</td></tr>
+          <tr><td>FN25dr, or "my grid is FN25"</td><td class="mono">FN25dr</td><td>Foxtrot November 2 5 Delta Romeo</td></tr>
+          <tr><td>DL/K4DIA, K4DIA/P</td><td class="mono">DL/K4DIA</td><td>Delta Lima stroke Kilo 4 Delta India Alfa</td></tr>
+          <tr><td>7,150 kHz</td><td class="mono">7150 kHz</td><td>7150 kilohertz</td></tr>
+          <tr><td>146.520 MHz</td><td class="mono">146.520 MHz</td><td>146 virgola 520 megahertz</td></tr>
+          <tr><td>73, and names in your glossary file</td><td>unchanged</td><td>unchanged</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">If the model garbles the swapped-out terms, the tool translates the plain words between them piece by piece, splices the terms back in order, and flags that over on screen.</p>
+  </section>
+
+  <section aria-labelledby="rules-h">
+    <header>
+      <span class="label">Built-in rules</span>
+      <h2 id="rules-h">The operator stays in control</h2>
+    </header>
+    <div class="rules">
+      <div class="rule-card"><h3>Keying is a physical act</h3><p>With review on (the default), the radio keys only after your own PTT press and a confirming press. The ID key sends your callsign directly. No timer or network request can key it.</p></div>
+      <div class="rule-card"><h3>Review before transmit</h3><p>You see your words and the translation before anything goes out. Only Enter sends; any other key, or 20 s of silence, discards.</p></div>
+      <div class="rule-card"><h3>Station ID in English</h3><p>FCC §97.119: your call in English phonetics on your first over, whenever 10 minutes would otherwise pass, and offered again when you quit. Nothing is sent on a timer. It refuses to transmit as N0CALL.</p></div>
+      <div class="rule-card"><h3>Disclosure on every over</h3><p>"Machine-translated transmission", in their language, so nobody is misled about the synthetic voice.</p></div>
+      <div class="rule-card"><h3>Hard limits</h3><p>45 s per recording, 90 s per transmission, and an unkey on every error, Ctrl-C, kill or dropped SSH session. Set the rig's own time-out timer too.</p></div>
+      <div class="rule-card"><h3>No voice cloning</h3><p>Stock synthetic voices only. The box converts what you said; the only words it adds are the disclosure line and your ID.</p></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="perf-h">
+    <header>
+      <span class="label">Performance</span>
+      <h2 id="perf-h">Pi 4 or Pi 5</h2>
+      <p class="lead">Start with a Pi 4. Memory isn't the limit; CPU speed is, and the Pi 5 is rated 2–3× faster.</p>
+    </header>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Board</th><th>Speech model</th><th>Voice quality</th><th class="num">Wait per 10 s over</th><th class="num">Draw, idle → load</th></tr></thead>
+        <tbody>
+          <tr><td>Raspberry Pi 4B</td><td>Whisper base</td><td>default voices</td><td class="num">about 5–12 s</td><td class="num">~3 → 6.5 W</td></tr>
+          <tr><td>Raspberry Pi 5</td><td>Whisper base or small</td><td>default voices</td><td class="num">about 3–8 s</td><td class="num">~3 → 11.5 W</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="estimate"><strong>Estimates, not measurements.</strong> They come from published reports and the Pi 5's rated speed-up. Default voices are medium quality (Italian is x_low). The built-in <span class="tool">bench</span> command measures the real numbers on the board.</p>
+  </section>
+
+  <section aria-labelledby="src-h">
+    <header>
+      <span class="label">Provenance</span>
+      <h2 id="src-h">Where the models came from</h2>
+      <p class="lead">Everything runs locally from open-source engines. What each model learned from still matters, and none is perfectly clean:</p>
+    </header>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Stage</th><th>Model</th><th>Trained on</th></tr></thead>
+        <tbody>
+          <tr><td>Speech to text</td><td>Whisper (MIT weights)</td><td>Audio collected from the web by OpenAI</td></tr>
+          <tr><td>Translation</td><td>Argos Translate packs</td><td>Mostly the OPUS collection: EU Parliament and UN records, volunteer sentences, and often film subtitles and web-crawled text. Each pack lists its sources.</td></tr>
+          <tr><td>Voice</td><td>Piper voices</td><td>Varies per voice; each has a model card saved next to it. Many were fine-tuned from a voice with a non-commercial research license.</td></tr>
+          <tr><td>Japanese voice</td><td>Open JTalk, nitech atr503</td><td>CC BY 3.0, Nagoya Institute of Technology</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="status-h">
+    <header>
+      <span class="label">Status</span>
+      <h2 id="status-h">Where it stands</h2>
+      <p class="lead">The software works end to end and is tested, but it hasn't run on a Pi with the real models yet. Each step below has a pass/fail gate.</p>
+    </header>
+    <ul class="milestones">
+      <li class="done"><span class="box">✓</span><div><strong>Prototype built</strong><p>Tool, installer and 105 automated tests. Checked against real whisper.cpp, CTranslate2, Open JTalk and Hamlib. Code-reviewed, with the findings fixed.</p></div></li>
+      <li><span class="box"></span><div><strong>Bench test on a Pi 4</strong><p>Gate: under 12 s of dead air for a 10 s over.</p></div></li>
+      <li><span class="box"></span><div><strong>Practice mode with real speech</strong><p>Gate: callsigns, reports and Q-codes correct in 10 of 10 overs.</p></div></li>
+      <li><span class="box"></span><div><strong>Into a dummy load</strong><p>Gate: clean audio with no ALC, ID on the first over, unkeys every time.</p></div></li>
+      <li><span class="box"></span><div><strong>Receive a real Italian FM signal</strong><p>Gate: the meaning comes through on strong signals.</p></div></li>
+      <li><span class="box"></span><div><strong>A full contact on simplex</strong><p>Gate: a complete QSO with a partner speaking the other language, no manual fixes.</p></div></li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>Concept by David P. Eisenhardt, Jr. (W4DPE).</span>
+    <span>Built on whisper.cpp, Argos Translate (OPUS-MT on CTranslate2), Piper and Open JTalk, each under its own open-source license.</span>
+  </footer>
+</main>
+
+<script>
+const LANGS = [
+  ["en", "English", "English", "Machine-translated transmission.", "home"],
+  ["ar", "العربية", "Arabic", "إرسال مترجم آليًا."],
+  ["ca", "Català", "Catalan", "Transmissió traduïda automàticament."],
+  ["cs", "Čeština", "Czech", "Strojově přeložené vysílání."],
+  ["da", "Dansk", "Danish", "Maskinoversat udsendelse."],
+  ["de", "Deutsch", "German", "Maschinell übersetzte Aussendung."],
+  ["el", "Ελληνικά", "Greek", "Μετάδοση με αυτόματη μετάφραση."],
+  ["es", "Español", "Spanish", "Transmisión traducida automáticamente."],
+  ["fa", "فارسی", "Persian", "ارسال با ترجمه ماشینی."],
+  ["fi", "Suomi", "Finnish", "Konekäännetty lähetys."],
+  ["fr", "Français", "French", "Transmission traduite automatiquement."],
+  ["hi", "हिन्दी", "Hindi", "मशीन द्वारा अनुवादित प्रसारण।"],
+  ["hu", "Magyar", "Hungarian", "Gépi fordítású adás."],
+  ["it", "Italiano", "Italian", "Trasmissione tradotta automaticamente."],
+  ["ja", "日本語", "Japanese", "機械翻訳による送信です。", "jtalk"],
+  ["lv", "Latviešu", "Latvian", "Mašīntulkota pārraide."],
+  ["nb", "Norsk", "Norwegian", "Maskinoversatt sending."],
+  ["nl", "Nederlands", "Dutch", "Machinaal vertaalde uitzending."],
+  ["pl", "Polski", "Polish", "Transmisja przetłumaczona maszynowo."],
+  ["pt", "Português", "Portuguese", "Transmissão traduzida automaticamente."],
+  ["ro", "Română", "Romanian", "Transmisie tradusă automat."],
+  ["ru", "Русский", "Russian", "Автоматически переведённая передача."],
+  ["sk", "Slovenčina", "Slovak", "Strojovo preložené vysielanie."],
+  ["sl", "Slovenščina", "Slovenian", "Strojno prevedena oddaja."],
+  ["sv", "Svenska", "Swedish", "Maskinöversatt sändning."],
+  ["sw", "Kiswahili", "Swahili", "Matangazo yaliyotafsiriwa na mashine."],
+  ["tr", "Türkçe", "Turkish", "Makine çevirisiyle yapılan yayın."],
+  ["uk", "Українська", "Ukrainian", "Автоматично перекладена передача."],
+  ["vi", "Tiếng Việt", "Vietnamese", "Bản phát được dịch bằng máy."],
+  ["zh", "中文", "Chinese", "本次发射为机器翻译。"],
+];
+const RTL = new Set(["ar", "fa"]);
+const grid = document.getElementById("langs");
+for (const [code, native, english, disc, kind] of LANGS) {
+  const card = document.createElement("article");
+  card.className = "lang" + (kind ? " " + kind : "");
+  card.dataset.search = (code + " " + native + " " + english).toLowerCase();
+  const engine = kind === "home" ? "Your side" : kind === "jtalk" ? "Voice: Open JTalk" : "Voice: Piper";
+  card.innerHTML =
+    '<div class="lang-top"><span class="native"></span><span class="code"></span></div>' +
+    '<span class="en"></span><span class="engine"></span><span class="disc"></span>';
+  card.querySelector(".native").textContent = native;
+  card.querySelector(".code").textContent = code;
+  card.querySelector(".en").textContent = english;
+  card.querySelector(".engine").textContent = engine;
+  const d = card.querySelector(".disc");
+  d.textContent = disc;
+  if (RTL.has(code)) { d.dir = "rtl"; card.querySelector(".native").dir = "rtl"; }
+  grid.appendChild(card);
+}
+document.getElementById("lang-filter").addEventListener("input", (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  for (const card of grid.children) card.hidden = q !== "" && !card.dataset.search.includes(q);
+});
+</script>
+</body>
+</html>

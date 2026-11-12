@@ -1,0 +1,27 @@
+[Unit]
+Description=RF Pi translator speech-to-text (whisper.cpp server, localhost only)
+Documentation=file:/etc/hampi/TRANSLATOR.md
+# Installed by scripts/install-translator.sh, which creates this flag file.
+# The server keeps the Whisper model in RAM (~400 MB for base) so each
+# transmission skips the model load.
+ConditionPathExists=/etc/hampi/translate.enabled
+ConditionPathExists=/usr/local/bin/whisper-server
+After=network.target
+# A missing model or bad setting must not restart forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__HAMPI_USER__
+# Defaults, in case translate.conf predates these keys. Note systemd reads
+# the file literally: no trailing "# comments" on WHISPER_* lines.
+Environment=WHISPER_MODEL=/opt/hampi/translate/models/ggml-base-q5_1.bin
+Environment=WHISPER_THREADS=4
+EnvironmentFile=-/etc/hampi/translate.conf
+ExecStart=/usr/local/bin/whisper-server -m ${WHISPER_MODEL} --host 127.0.0.1 --port 8178 -t ${WHISPER_THREADS} -bo 1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

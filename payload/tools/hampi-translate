@@ -1,0 +1,1822 @@
+#!/usr/bin/env python3
+"""RF Pi offline voice translator for phone (voice) modes.
+
+Speak your own language into the headset. The Pi transcribes it, translates
+it, and speaks the other operator's language into the radio (English plus
+29 partner languages; see LANGUAGES). Incoming
+transmissions run the same chain in reverse into your headphones, with the
+original transcript and the translation on screen. Nothing leaves the Pi:
+speech-to-text (whisper.cpp), translation (Argos Translate) and text-to-
+speech (Piper) all run locally, with no internet.
+
+Concept by David P. Eisenhardt, Jr. (W4DPE).
+
+  hampi-translate check                  verify engines, packs, voices, audio devices, rigctld
+  hampi-translate run                    operate: local PTT -> translate -> TX; RX -> headphones
+  hampi-translate run --no-tx            practice: translated audio goes to your headphones
+  hampi-translate text "Good morning"    translate typed text (--speak, --out x.wav, --rx,
+                                         --from/--to LANG)
+  hampi-translate file in.wav            translate a recording (--out x.wav, --rx)
+  hampi-translate bench [in.wav]         time each stage on this board
+  hampi-translate devices                list audio devices
+  hampi-translate fetch-packs --langs it translation packs (the one step needing internet)
+
+Config: /etc/hampi/translate.conf. The callsign comes from /etc/hampi/station.conf.
+Models: sudo rfpi-translator-install (once, needs internet; it is
+scripts/install-translator.sh in the repo).
+
+Keying policy (same as the rest of RF Pi: keying stays a physical act). The
+radio is keyed only as the direct result of the operator's own push-to-talk
+press, and with REVIEW=1 only after a second confirming press (the "i" ID
+command sends the callsign directly). No timer, network request or dashboard
+button can key the transmitter.
+"""
+
+import argparse
+import io
+import json
+import os
+import queue
+import re
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import wave
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+
+CONF_PATH = os.environ.get("HAMPI_TRANSLATE_CONF", "/etc/hampi/translate.conf")
+STATION_CONF = os.environ.get("HAMPI_STATION_CONF", "/etc/hampi/station.conf")
+VENV_PY = os.environ.get("HAMPI_TRANSLATE_PY", "/opt/hampi/translate/venv/bin/python3")
+SHARE = "/opt/hampi/translate"
+
+DEFAULTS = {
+    # --- Languages (ISO 639-1) ---
+    "MY_LANG": "en",
+    "THEIR_LANG": "it",
+    # --- Speech to text: whisper.cpp ---
+    "STT": "server",                       # server (model stays loaded) | cli
+    "WHISPER_URL": "http://127.0.0.1:8178",
+    "WHISPER_CLI": "/usr/local/bin/whisper-cli",
+    "WHISPER_MODEL": SHARE + "/models/ggml-base-q5_1.bin",
+    "WHISPER_THREADS": "4",
+    # --- Translation: Argos Translate packs, run on CTranslate2 ---
+    "ARGOS_DIR": SHARE + "/argos",
+    "TRANSLATE_BEAM": "2",                 # 1 = fastest, 4 = Argos default (slower on a Pi 4)
+    # --- Text to speech: Piper (one voice per language) ---
+    "PIPER": SHARE + "/venv/bin/piper",
+    "VOICE_EN": SHARE + "/voices/en_US-ljspeech-medium.onnx",
+    "VOICE_IT": SHARE + "/voices/it_IT-riccardo-x_low.onnx",
+    "OPENJTALK_DIC": "/var/lib/mecab/dic/open-jtalk/naist-jdic",   # Japanese voice dictionary
+    # --- Audio devices (name substring or index; 'default' = system default) ---
+    "OPERATOR_IN": "default",              # your headset mic
+    "OPERATOR_OUT": "default",             # your headphones
+    "RADIO_IN": "USB Audio",               # radio interface (Digirig/SignaLink/CM108) input
+    "RADIO_OUT": "USB Audio",              # radio interface output -> rig data/mic input
+    "RADIO_GAIN": "0.8",                   # TX audio level into the rig (0-1); set ALC with this
+    # --- Radio PTT (how the Pi keys the transmitter) ---
+    "PTT": "rigctld",                      # rigctld | rts | dtr | gpio | vox | none
+    "RIGCTLD": "127.0.0.1:4532",
+    "PTT_SERIAL": "/dev/ttyUSB0",
+    "PTT_GPIO": "17",
+    "PTT_LEAD_MS": "300",                  # key-up delay before audio (rig TX settle)
+    "PTT_TAIL_MS": "200",
+    "MAX_TX_SEC": "90",                    # hard cap on any one keyed period
+    # --- Local PTT (how you talk to the Pi) ---
+    "LOCAL_PTT": "keyboard",               # keyboard (Enter toggles) | gpio (footswitch, hold to talk)
+    "LOCAL_PTT_GPIO": "27",
+    "ID_GPIO": "",                         # optional second button: send station ID / end contact
+    "MAX_RECORD_SEC": "45",
+    # --- Operating behaviour ---
+    "REVIEW": "1",                         # show the translation and wait for a confirming press
+    "REVIEW_TIMEOUT": "20",
+    "DISCLOSE": "1",                       # prefix "machine-translated transmission" in their language
+    "ID_EVERY_MIN": "10",                  # FCC 97.119: every 10 min and at the end of a contact
+    "ID_WAV": "",                          # optional recording of your own voice giving your call
+    "RX": "1",                             # translate incoming audio
+    "RX_LANG": "",                         # blank = THEIR_LANG; 'auto' = let Whisper detect
+    "RX_THRESHOLD_DB": "-38",              # level that counts as signal (squelch-open audio)
+    "RX_HANG_MS": "900",                   # silence that ends an incoming transmission
+    "RX_MIN_MS": "700",                    # ignore bursts shorter than this
+    "GLOSSARY": "/etc/hampi/translate-glossary.txt",
+    "STATUS_FILE": "/var/lib/hampi/translate-status.json",
+}
+
+# Languages that work end to end: an Argos Translate pack in both directions
+# with English, Whisper speech recognition, and an offline voice (a Piper
+# voice, or Open JTalk for Japanese). Codes are Argos codes.
+#   code: (name, spoken disclosure, decimal-point word, Whisper code)
+# The disclosure is said before each translated over; have a native speaker
+# check the wording before relying on it.
+LANGUAGES = {
+    "en": ("English", "Machine-translated transmission.", "point", "en"),
+    "ar": ("Arabic", "إرسال مترجم آليًا.", "فاصلة", "ar"),
+    "ca": ("Catalan", "Transmissió traduïda automàticament.", "coma", "ca"),
+    "cs": ("Czech", "Strojově přeložené vysílání.", "celá", "cs"),
+    "da": ("Danish", "Maskinoversat udsendelse.", "komma", "da"),
+    "de": ("German", "Maschinell übersetzte Aussendung.", "Komma", "de"),
+    "el": ("Greek", "Μετάδοση με αυτόματη μετάφραση.", "κόμμα", "el"),
+    "es": ("Spanish", "Transmisión traducida automáticamente.", "punto", "es"),
+    "fa": ("Persian", "ارسال با ترجمه ماشینی.", "ممیز", "fa"),
+    "fi": ("Finnish", "Konekäännetty lähetys.", "pilkku", "fi"),
+    "fr": ("French", "Transmission traduite automatiquement.", "virgule", "fr"),
+    "hi": ("Hindi", "मशीन द्वारा अनुवादित प्रसारण।", "दशमलव", "hi"),
+    "hu": ("Hungarian", "Gépi fordítású adás.", "egész", "hu"),
+    "it": ("Italian", "Trasmissione tradotta automaticamente.", "virgola", "it"),
+    "ja": ("Japanese", "機械翻訳による送信です。", "てん", "ja"),
+    "lv": ("Latvian", "Mašīntulkota pārraide.", "komats", "lv"),
+    "nb": ("Norwegian", "Maskinoversatt sending.", "komma", "no"),
+    "nl": ("Dutch", "Machinaal vertaalde uitzending.", "komma", "nl"),
+    "pl": ("Polish", "Transmisja przetłumaczona maszynowo.", "przecinek", "pl"),
+    "pt": ("Portuguese", "Transmissão traduzida automaticamente.", "vírgula", "pt"),
+    "ro": ("Romanian", "Transmisie tradusă automat.", "virgulă", "ro"),
+    "ru": ("Russian", "Автоматически переведённая передача.", "запятая", "ru"),
+    "sk": ("Slovak", "Strojovo preložené vysielanie.", "celá", "sk"),
+    "sl": ("Slovenian", "Strojno prevedena oddaja.", "vejica", "sl"),
+    "sv": ("Swedish", "Maskinöversatt sändning.", "komma", "sv"),
+    "sw": ("Swahili", "Matangazo yaliyotafsiriwa na mashine.", "nukta", "sw"),
+    "tr": ("Turkish", "Makine çevirisiyle yapılan yayın.", "virgül", "tr"),
+    "uk": ("Ukrainian", "Автоматично перекладена передача.", "кома", "uk"),
+    "vi": ("Vietnamese", "Bản phát được dịch bằng máy.", "phẩy", "vi"),
+    "zh": ("Chinese", "本次发射为机器翻译。", "点", "zh"),
+}
+DISCLOSURE = {k: v[1] for k, v in LANGUAGES.items()}
+DECIMAL_WORD = {k: v[2] for k, v in LANGUAGES.items()}
+WHISPER_CODE = {k: v[3] for k, v in LANGUAGES.items()}
+FROM_WHISPER = {v: k for k, v in WHISPER_CODE.items()}
+
+
+def whisper_code(lang):
+    """Argos code -> the code Whisper expects (only Norwegian differs)."""
+    return WHISPER_CODE.get(lang, lang)
+
+
+# Text Whisper is known to invent from noise or silence; never transmit or
+# play these as if someone said them.
+HALLUCINATIONS = (
+    "thanks for watching", "thank you for watching", "subtitles by",
+    "sottotitoli creati dalla comunità amara", "sottotitoli a cura di",
+    "subtítulos realizados por la comunidad de amara", "untertitel der amara",
+    "sous-titres réalisés par la communauté d'amara",
+    "ご視聴ありがとうございました", "チャンネル登録",
+    "请不吝点赞", "字幕由amara.org社区提供", "продолжение следует",
+)
+
+TRUE = ("1", "yes", "true", "on")
+
+
+def load_kv(path, base=None):
+    """KEY=VALUE config, same format as the other /etc/hampi/*.conf files."""
+    conf = dict(base or {})
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if "=" not in line or line.startswith("#"):
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k.startswith("export "):
+                    k = k[7:].strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]                     # quoted: taken verbatim
+                else:
+                    # A trailing comment needs two spaces or a tab before the
+                    # "#", so a device name like "USB Audio #2" survives.
+                    v = re.split(r"(?:\s{2,}|\t)#", v, maxsplit=1)[0].strip()
+                conf[k] = v
+    except OSError:
+        pass
+    return conf
+
+
+def load_conf(path=None):
+    conf = load_kv(path or CONF_PATH, DEFAULTS)
+    station = load_kv(STATION_CONF)
+    conf["CALLSIGN"] = station.get("CALLSIGN", "N0CALL").upper()
+    return conf
+
+
+def flag(conf, key):
+    return str(conf.get(key, "")).strip().lower() in TRUE
+
+
+def voice_for(conf, lang):
+    return conf.get("VOICE_" + lang.upper(), "")
+
+
+# ---------------------------------------------------------------------------
+# Ham jargon: callsigns, signal reports, Q-codes, grids and frequencies must
+# come out the other side exactly as said, never "translated".
+# ---------------------------------------------------------------------------
+
+ITU_LETTERS = {
+    "A": "Alfa", "B": "Bravo", "C": "Charlie", "D": "Delta", "E": "Echo",
+    "F": "Foxtrot", "G": "Golf", "H": "Hotel", "I": "India", "J": "Juliett",
+    "K": "Kilo", "L": "Lima", "M": "Mike", "N": "November", "O": "Oscar",
+    "P": "Papa", "Q": "Quebec", "R": "Romeo", "S": "Sierra", "T": "Tango",
+    "U": "Uniform", "V": "Victor", "W": "Whiskey", "X": "X-ray", "Y": "Yankee",
+    "Z": "Zulu",
+}
+SPOKEN_LETTER = {v.lower(): k for k, v in ITU_LETTERS.items()}
+SPOKEN_LETTER.update({"alpha": "A", "juliet": "J", "whisky": "W", "xray": "X"})
+SPOKEN_DIGIT = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+                "niner": "9"}
+_RD = r"(?:[1-5]|one|two|three|four|five)"            # readability 1-5
+_SD = r"(?:[1-9]|one|two|three|four|five|six|seven|eight|nine|niner)"  # strength 1-9
+
+# Optional "DL/" style prefix, the call, optional "/P" style suffix.
+CALL_RE = re.compile(
+    r"(?<![A-Za-z0-9/])((?:[A-Za-z0-9]{1,4}/)?"
+    r"(?:[A-Za-z]{1,2}|[A-Za-z][0-9]|[0-9][A-Za-z])[0-9][A-Za-z]{1,4}"
+    r"(?:/[A-Za-z0-9]{1,4})?)(?![A-Za-z0-9/])")
+NOT_CALLS = {"H2O", "B2B", "B2C", "Y2K", "P2P", "W3C"}     # callsign-shaped ordinary words
+GRID_RE = re.compile(r"(?<![A-Za-z0-9])([A-Ra-r]{2}[0-9]{2}(?:[A-Xa-x]{2})?)(?![A-Za-z0-9])")
+# A 4-character grid (FN42) looks like many other tokens, so it needs a cue.
+GRID_CONTEXT_RE = re.compile(r"\b(?:grid|locator|locatore|square|maidenhead)\b[\w\s,']{0,20}$",
+                             re.I)
+# Words after a number that mean it is a quantity, not a signal report.
+_NOT_RST = (r"(?!\s*(?:-|\b(?:watts?|w|elements?|el|met(?:er|re)s?|m|feet|foot|ft|miles?|km|"
+            r"years?|months?|days?|hours?|minutes?|seconds?|contacts?|qsos?|stations?|countries|"
+            r"amps?|volts?|dollars?|euros?|percent|degrees?|o'?clock|a\.?m|p\.?m|mhz|khz|hz|"
+            r"zero|one|two|three|four|five|six|seven|eight|nine|niner|\d)\b))")
+_NOT_AFTER_NUM = (r"(?<!\b(?:zero|four|five|nine)\s)(?<!\b(?:one|two|six)\s)"
+                  r"(?<!\b(?:three|seven|eight|niner)\s)(?<!\d\s)(?<![\w.])")
+# "five by nine": readability 5 stands alone; "four by seven" needs a report cue
+RST_BY_RE = re.compile(rf"{_NOT_AFTER_NUM}({_RD})\s+by\s+({_SD})(?![\w]){_NOT_RST}", re.I)
+# "five nine", "5 9": readability 5 only, so ordinary pairs ("two three") are left alone
+RST_PAIR_RE = re.compile(rf"{_NOT_AFTER_NUM}(5|five)\s+({_SD})(?![\w]){_NOT_RST}", re.I)
+# "59", "599", "5/9": only next to report words, so "I'm 59" stays a number
+RST_COMPACT_RE = re.compile(rf"(?<![\w.:/-])([345])/?([1-9])([1-9])?(?![\w.:/]){_NOT_RST}")
+RST_CONTEXT_RE = re.compile(
+    r"\b(?:report|signal|signals|rst|you'?re|you are|you|copy|copying|giving|solid|"
+    r"rapporto|segnale|sei|reporte|señal|rapport)\b[\w\s,']{0,12}$", re.I)
+Q_CODES = ("QRA QRG QRK QRL QRM QRN QRO QRP QRQ QRS QRT QRU QRV QRX QRZ QSB QSD QSK "
+           "QSL QSO QSP QSX QSY QTC QTH QTR CQ").split()
+Q_RE = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(Q_CODES) + r")(\?)?(?![A-Za-z0-9])", re.I)
+FREQ_RE = re.compile(
+    r"(?<![\w.,])(\d[\d.,]{0,10}\d|\d)\s*(mhz|khz|megahertz|kilohertz|megs?)\b", re.I)
+GREETING_RE = re.compile(r"(?<![\w.])(73|88)s?(?![\w.])")
+
+# A placeholder Argos copies through untouched (it reads like an acronym).
+PH_FMT = "ZXQ{}"
+PH_RE = re.compile(r"Z\s?X\s?Q\s?(\d+)", re.I)
+
+
+def phonetic(call):
+    """K4DIA -> 'Kilo 4 Delta India Alfa'; '/' -> 'stroke'."""
+    out = []
+    for ch in call.upper():
+        if ch.isalpha():
+            out.append(ITU_LETTERS[ch])
+        elif ch.isdigit():
+            out.append(ch)
+        elif ch == "/":
+            out.append("stroke")
+    return " ".join(out)
+
+
+def spell(s):
+    """'QTH' -> 'Q T H' so a TTS voice says the letters, in its own language."""
+    return " ".join(s.upper())
+
+
+# Open JTalk spells Latin words letter by letter ("Kilo" -> K-I-L-O), so for
+# Japanese the phonetics and letter names are given in katakana.
+JA_ITU = {"Alfa": "アルファ", "Bravo": "ブラボー", "Charlie": "チャーリー", "Delta": "デルタ",
+          "Echo": "エコー", "Foxtrot": "フォックストロット", "Golf": "ゴルフ", "Hotel": "ホテル",
+          "India": "インディア", "Juliett": "ジュリエット", "Kilo": "キロ", "Lima": "リマ",
+          "Mike": "マイク", "November": "ノベンバー", "Oscar": "オスカー", "Papa": "パパ",
+          "Quebec": "ケベック", "Romeo": "ロメオ", "Sierra": "シエラ", "Tango": "タンゴ",
+          "Uniform": "ユニフォーム", "Victor": "ビクター", "Whiskey": "ウィスキー",
+          "X-ray": "エックスレイ", "Yankee": "ヤンキー", "Zulu": "ズールー", "stroke": "ストローク"}
+JA_LETTER = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                     "エー ビー シー ディー イー エフ ジー エイチ アイ ジェー ケー エル エム "
+                     "エヌ オー ピー キュー アール エス ティー ユー ブイ ダブリュー エックス "
+                     "ワイ ゼット".split()))
+
+
+@dataclass
+class Protected:
+    kind: str
+    display: str
+    spoken_en: str = ""
+    freq: tuple = ()
+
+    def spoken(self, lang):
+        if self.kind == "freq":
+            whole, frac, unit = self.freq
+            word = DECIMAL_WORD.get(lang, "point")
+            num = f"{whole} {word} {frac}" if frac else whole
+            if lang == "ja":
+                unit = "キロヘルツ" if unit == "kilohertz" else "メガヘルツ"
+            return f"{num} {unit}"
+        if lang == "ja":
+            if self.kind in ("call", "grid"):
+                return " ".join(JA_ITU.get(w, w) for w in self.spoken_en.split())
+            if self.kind == "q":
+                letters = " ".join(JA_LETTER[c] for c in self.display if c.isalpha())
+                return letters + ("？" if self.display.endswith("?") else "")
+        return self.spoken_en or self.display
+
+
+def collapse_spelled_calls(text):
+    """'kilo four delta india alfa' -> 'K4DIA' (Whisper often writes calls out)."""
+    toks = list(re.finditer(r"[A-Za-z]+(?:-[A-Za-z]+)?|\d|/", text))
+
+    words = set()                   # tokens that were phonetic words ("kilo")
+
+    def sym(m):
+        w = m.group(0).lower()
+        if w in SPOKEN_LETTER:
+            words.add(m.start())
+            return SPOKEN_LETTER[w]
+        if w in SPOKEN_DIGIT:
+            return SPOKEN_DIGIT[w]
+        if w in ("stroke", "slash", "/"):
+            return "/"
+        if len(w) == 1 and w.isalnum():
+            return w.upper()
+        return None
+
+    def plausible(part):
+        """All the letters are phonetic words, or all are single characters.
+        A mix ("Mike, 1 a day", "November 2 I went") is ordinary speech."""
+        letters = [m.start() in words for m, sy in part if sy.isalpha()]
+        return bool(letters) and (all(letters) or not any(letters))
+
+    runs, cur = [], []
+    for m in toks:
+        s = sym(m)
+        joined = cur and re.fullmatch(r"[\s,-]*", text[cur[-1][0].end():m.start()])
+        if s is not None and (not cur or joined):
+            cur.append((m, s))
+            continue
+        if cur:
+            runs.append(cur)
+        cur = [(m, s)] if s is not None else []
+    if cur:
+        runs.append(cur)
+
+    repl = []
+    for run in runs:
+        i = 0
+        while i < len(run):
+            for j in range(len(run), i + 2, -1):            # at least 3 symbols
+                cand = "".join(s for _, s in run[i:j])
+                if (CALL_RE.fullmatch(cand) and cand not in NOT_CALLS
+                        and plausible(run[i:j])):
+                    repl.append((run[i][0].start(), run[j - 1][0].end(), cand))
+                    i = j
+                    break
+            else:
+                i += 1
+    for a, b, cand in reversed(repl):
+        text = text[:a] + cand + text[b:]
+    return text
+
+
+def _word_digit(w):
+    return SPOKEN_DIGIT.get(w.lower(), w)
+
+
+def protect(text, glossary=()):
+    """Swap ham jargon for placeholders. Returns (masked_text, [Protected])."""
+    items = []
+
+    def add(item):
+        items.append(item)
+        return f" {PH_FMT.format(len(items) - 1)} "
+
+    text = collapse_spelled_calls(text)
+    for term in sorted(glossary, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w]){re.escape(term)}(?![\w])",
+                      lambda m: add(Protected("term", m.group(0))), text, flags=re.I)
+
+    def call(m):
+        c = m.group(1).upper()
+        if c in NOT_CALLS:
+            return m.group(0)
+        return add(Protected("call", c, phonetic(c)))
+    text = CALL_RE.sub(call, text)
+
+    def grid(m):
+        g = m.group(1)
+        if len(g) == 4 and not GRID_CONTEXT_RE.search(m.string[:m.start()]):
+            return m.group(0)
+        g = g[:4].upper() + g[4:].lower()
+        spoken = " ".join(ITU_LETTERS[c.upper()] if c.isalpha() else c for c in g)
+        return add(Protected("grid", g, spoken))
+    text = GRID_RE.sub(grid, text)
+
+    def rst(m):
+        digits = [_word_digit(g) for g in m.groups() if g]
+        return add(Protected("rst", " ".join(digits)))
+    def rst_cued(m):
+        if not RST_CONTEXT_RE.search(m.string[:m.start()]):
+            return m.group(0)
+        return rst(m)
+
+    def rst_by(m):
+        return rst(m) if m.group(1).lower() in ("5", "five") else rst_cued(m)
+    text = RST_BY_RE.sub(rst_by, text)
+    text = RST_PAIR_RE.sub(rst, text)
+    text = RST_COMPACT_RE.sub(rst_cued, text)
+
+    def qcode(m):
+        q = m.group(1).upper() + (m.group(2) or "")
+        return add(Protected("q", q, spell(m.group(1)) + (m.group(2) or "")))
+    text = Q_RE.sub(qcode, text)
+
+    def freq(m):
+        num, unit = m.group(1), m.group(2).lower()
+        unit = "kilohertz" if unit.startswith("k") else "megahertz"
+        if unit == "kilohertz" and re.fullmatch(r"\d{1,3},\d{3}(?:\.\d+)?", num):
+            num = num.replace(",", "")          # 7,150 kHz: a thousands comma
+        num = num.replace(",", ".")             # 14,250 MHz: a decimal comma
+        if not re.fullmatch(r"\d{1,5}(?:\.\d{1,4})?", num):
+            return m.group(0)
+        whole, _, frac = num.partition(".")
+        shown = f"{whole}.{frac}" if frac else whole
+        disp = f"{shown} {'kHz' if unit == 'kilohertz' else 'MHz'}"
+        return add(Protected("freq", disp, freq=(whole, frac, unit)))
+    text = FREQ_RE.sub(freq, text)
+
+    text = GREETING_RE.sub(lambda m: add(Protected("greeting", m.group(1))), text)
+    return re.sub(r"\s{2,}", " ", text).strip(), items
+
+
+def restore(translated, items, lang):
+    """Put the jargon back. Returns (display, spoken), or None if the
+    translator dropped or duplicated a placeholder."""
+    found = [int(m.group(1)) for m in PH_RE.finditer(translated)]
+    if sorted(found) != list(range(len(items))):
+        return None
+
+    def sub(form):
+        def f(m):
+            it = items[int(m.group(1))]
+            return it.display if form == "display" else it.spoken(lang)
+        return tidy(PH_RE.sub(f, translated))
+    return sub("display"), sub("spoken")
+
+
+def tidy(text):
+    """Collapse the spaces placeholders leave behind, including before punctuation."""
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def load_glossary(path):
+    """One do-not-translate term per line (names, rig models, places)."""
+    terms = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    terms.append(line)
+    except OSError:
+        pass
+    return terms
+
+
+@dataclass
+class Translation:
+    source: str
+    display: str        # what the screen shows
+    spoken: str         # what the voice says (callsigns as phonetics, etc.)
+    fallback: bool = False
+
+
+class PhraseTranslator:
+    """Jargon-safe wrapper around any `backend(text, src, dst) -> str`."""
+
+    def __init__(self, backend, glossary=()):
+        self.backend = backend
+        self.glossary = list(glossary)
+
+    def translate(self, text, src, dst):
+        text = text.strip()
+        masked, items = protect(text, self.glossary)
+        if src == dst:
+            out = restore(masked, items, dst)
+            return Translation(text, *out)
+        if not items:
+            out = self.backend(masked, src, dst).strip()
+            return Translation(text, out, out)
+        out = restore(self.backend(masked, src, dst), items, dst)
+        if out is not None:
+            return Translation(text, *out)
+        # The model mangled a placeholder: translate the plain-language runs
+        # between the jargon one by one and splice the jargon back in order.
+        disp, spk = [], []
+        for part in re.split(r"(ZXQ\d+)", masked):
+            m = re.fullmatch(r"ZXQ(\d+)", part)
+            if m:
+                it = items[int(m.group(1))]
+                disp.append(it.display)
+                spk.append(it.spoken(dst))
+            elif re.search(r"\w", part):
+                t = self.backend(part.strip(), src, dst).strip()
+                disp.append(t)
+                spk.append(t)
+            elif part.strip():
+                disp.append(part.strip())
+                spk.append(part.strip())
+        return Translation(text, tidy(" ".join(disp)), tidy(" ".join(spk)), fallback=True)
+
+
+ARGOS_DIR = SHARE + "/argos"          # Argos Translate language packs, unzipped
+ARGOS_INDEX = "https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json"
+
+
+def find_packs(root=ARGOS_DIR):
+    """{(from, to): (pack_dir, metadata)} for every unzipped Argos pack."""
+    packs = {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return packs
+    for name in names:
+        try:
+            with open(os.path.join(root, name, "metadata.json"), encoding="utf-8") as fh:
+                meta = json.load(fh)
+            packs[(meta["from_code"], meta["to_code"])] = (os.path.join(root, name), meta)
+        except (OSError, ValueError, KeyError):
+            continue
+    return packs
+
+
+def split_sentences(text):
+    """Radio overs are a few short sentences; a full NLP splitter isn't needed.
+    Also splits after 。！？ (Chinese, Japanese), । (Hindi) and ؟ (Arabic, Persian)."""
+    parts = re.split(r"(?<=[.!?])\s+|(?<=[。！？।؟])\s*", text.strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+class PackBackend:
+    """Runs Argos Translate language packs (OPUS-MT models) directly on
+    CTranslate2 + SentencePiece, in-process and loaded once.
+
+    The argostranslate library itself is deliberately not used: it imports
+    stanza and with it PyTorch at start-up (hundreds of MB and many seconds
+    on a Pi 4) for sentence splitting this tool doesn't need."""
+
+    def __init__(self, root=ARGOS_DIR, beam=2, threads=4):
+        self.root, self.beam, self.threads = root, int(beam), int(threads)
+        self._loaded = {}
+
+    def _load(self, src, dst):
+        pack = find_packs(self.root).get((src, dst))
+        if pack is None:
+            raise RuntimeError(f"No translation pack for {src}->{dst} in {self.root}. "
+                               f"Run: sudo rfpi-translator-install --langs "
+                               f"{dst if src == 'en' else src}")
+        path, meta = pack
+        sp_model = os.path.join(path, "sentencepiece.model")
+        if not os.path.exists(sp_model):
+            raise RuntimeError(f"{path} uses a BPE tokenizer; pick a SentencePiece pack.")
+        import ctranslate2
+        import sentencepiece
+        translator = ctranslate2.Translator(os.path.join(path, "model"), device="cpu",
+                                            compute_type="int8", inter_threads=1,
+                                            intra_threads=self.threads)
+        return translator, sentencepiece.SentencePieceProcessor(model_file=sp_model), \
+            meta.get("target_prefix", "")
+
+    def __call__(self, text, src, dst):
+        key = (src, dst)
+        if key not in self._loaded:
+            self._loaded[key] = self._load(src, dst)
+        translator, sp, prefix = self._loaded[key]
+        sentences = split_sentences(text)
+        if not sentences:
+            return ""
+        tokens = [sp.encode(s, out_type=str) for s in sentences]
+        results = translator.translate_batch(
+            tokens, target_prefix=[[prefix]] * len(tokens) if prefix else None,
+            beam_size=self.beam, num_hypotheses=1, length_penalty=0.2,
+            replace_unknowns=True,
+            # A translation is about as long as its source; cap runaway loops.
+            max_decoding_length=min(256, 2 * max(len(t) for t in tokens) + 16))
+        out = []
+        for r in results:
+            v = sp.decode_pieces(r.hypotheses[0]).replace("\u2581", " ").strip()
+            if prefix and v.startswith(prefix):
+                v = v[len(prefix):].strip()
+            out.append(v)
+        return " ".join(out)
+
+
+def _version(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v)))
+
+
+def fetch_packs(mine, others, root=ARGOS_DIR, index_url=ARGOS_INDEX):
+    """Download and unzip the Argos packs for mine<->each other language.
+    The only part of the translator that needs internet."""
+    import shutil
+    import urllib.request
+    import zipfile
+    with urllib.request.urlopen(index_url, timeout=60) as resp:
+        index = json.loads(resp.read().decode("utf-8"))
+    os.makedirs(root, exist_ok=True)
+    missing = []
+    for other in others:
+        for a, b in ((mine, other), (other, mine)):
+            entries = [e for e in index if e.get("from_code") == a and e.get("to_code") == b]
+            if not entries:
+                missing.append(f"{a}->{b}")
+                continue
+            e = max(entries, key=lambda x: _version(x.get("package_version", "0")))
+            url = next((l for l in e.get("links", []) if l.startswith("http")), None)
+            if url is None:
+                missing.append(f"{a}->{b}")
+                continue
+            print(f"  {a}->{b}  {e.get('package_version')}  {url}")
+            with tempfile.TemporaryDirectory() as d:
+                zpath = os.path.join(d, "pack.zip")
+                with urllib.request.urlopen(url, timeout=600) as resp, open(zpath, "wb") as fh:
+                    shutil.copyfileobj(resp, fh)
+                with zipfile.ZipFile(zpath) as z:
+                    top = {n.split("/", 1)[0] for n in z.namelist()}
+                    if len(top) != 1 or any(n.startswith("/") or ".." in n.split("/")
+                                            for n in z.namelist()):
+                        raise RuntimeError(f"unexpected layout in {url}")
+                    dest = os.path.join(root, top.pop())
+                    shutil.rmtree(dest, ignore_errors=True)
+                    z.extractall(root)
+            readme = os.path.join(dest, "README.md")
+            if os.path.exists(readme):
+                print(f"     training data and license: {readme}")
+    if missing:
+        raise RuntimeError("No Argos pack for: " + ", ".join(missing))
+
+
+def run_tool(cmd, **kw):
+    """subprocess.run that reports the program's own error text on failure."""
+    try:
+        return subprocess.run(cmd, check=True, capture_output=True, **kw)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{cmd[0]} is not installed ({exc}). "
+                           "Run: sudo rfpi-translator-install") from exc
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+        raise RuntimeError(f"{os.path.basename(str(cmd[0]))} failed "
+                           f"(exit {exc.returncode}): {err or 'no error output'}") from exc
+
+
+def clean_transcript(text):
+    """Drop Whisper's non-speech tags and known noise hallucinations."""
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    low = text.lower()
+    if any(h in low for h in HALLUCINATIONS) or not re.search(r"\w", text):
+        return ""
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers (numpy only; 16 kHz mono float32 is the internal format)
+# ---------------------------------------------------------------------------
+
+STT_RATE = 16000
+
+
+def _np():
+    import numpy
+    return numpy
+
+
+def to_mono(x):
+    np = _np()
+    x = np.asarray(x, dtype=np.float32)
+    return x.mean(axis=1) if x.ndim == 2 else x
+
+
+def resample(x, src, dst):
+    """Windowed-sinc low-pass (when downsampling) + linear interpolation.
+    Plenty for 300-3000 Hz voice; avoids a scipy dependency."""
+    np = _np()
+    x = to_mono(x)
+    if src == dst or len(x) == 0:
+        return x
+    if dst < src and len(x) >= 97:      # shorter than the filter: nothing worth filtering
+        cutoff = 0.45 * dst / src
+        n = np.arange(-48, 49)
+        h = 2 * cutoff * np.sinc(2 * cutoff * n) * np.hamming(len(n))
+        x = np.convolve(x, (h / h.sum()).astype(np.float32), mode="same")
+    t_out = np.arange(int(len(x) * dst / src)) * (src / dst)
+    return np.interp(t_out, np.arange(len(x)), x).astype(np.float32)
+
+
+def rms_db(x):
+    np = _np()
+    if len(x) == 0:
+        return -120.0
+    r = float(np.sqrt(np.mean(np.square(x, dtype=np.float64))))
+    return 20 * np.log10(r) if r > 1e-6 else -120.0
+
+
+def read_wav(path_or_bytes):
+    np = _np()
+    src = io.BytesIO(path_or_bytes) if isinstance(path_or_bytes, bytes) else path_or_bytes
+    with wave.open(src, "rb") as w:
+        rate, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    if width == 2:
+        x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 1:
+        x = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+    elif width == 4:
+        x = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV sample width {width}")
+    if ch > 1:
+        x = x.reshape(-1, ch).mean(axis=1)
+    return x, rate
+
+
+def wav_bytes(x, rate):
+    np = _np()
+    pcm = (np.clip(to_mono(x), -1, 1) * 32767).astype("<i2").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(rate))
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def write_wav(path, x, rate):
+    with open(path, "wb") as fh:
+        fh.write(wav_bytes(x, rate))
+
+
+def join_audio(parts, rate, gap_ms=250):
+    np = _np()
+    gap = np.zeros(int(rate * gap_ms / 1000), dtype=np.float32)
+    out = []
+    for p in parts:
+        if p is not None and len(p):
+            if out:
+                out.append(gap)
+            out.append(to_mono(p))
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+
+
+class Segmenter:
+    """Cuts a continuous receive stream into transmissions: audio above the
+    threshold opens a segment, RX_HANG_MS of quiet closes it."""
+
+    def __init__(self, rate, threshold_db=-38.0, hang_ms=900, min_ms=700,
+                 max_s=90, preroll_ms=250):
+        self.rate = rate
+        self.thr = threshold_db
+        self.hang = int(rate * hang_ms / 1000)
+        self.min = int(rate * min_ms / 1000)
+        self.max = int(rate * max_s)
+        self.pre = int(rate * preroll_ms / 1000)
+        self.reset()
+
+    def reset(self):
+        self.buf, self.n, self.quiet, self.active = [], 0, 0, False
+        self.ring, self.ring_n = [], 0
+
+    def feed(self, block):
+        """Feed a block of samples; returns a list of finished segments."""
+        np = _np()
+        block = to_mono(block)
+        loud = rms_db(block) > self.thr
+        done = []
+        if not self.active:
+            self.ring.append(block)
+            self.ring_n += len(block)
+            while self.ring and self.ring_n - len(self.ring[0]) >= self.pre:
+                self.ring_n -= len(self.ring.pop(0))
+            if loud:
+                self.active, self.buf, self.n, self.quiet = True, list(self.ring), self.ring_n, 0
+                self.ring, self.ring_n = [], 0
+            return done
+        self.buf.append(block)
+        self.n += len(block)
+        self.quiet = 0 if loud else self.quiet + len(block)
+        if self.quiet >= self.hang or self.n >= self.max:
+            seg = np.concatenate(self.buf)
+            if self.quiet >= self.hang:
+                seg = seg[:max(0, len(seg) - self.quiet + self.hang // 4)]
+            if len(seg) - self.pre >= self.min:
+                done.append(seg)
+            self.active, self.buf, self.n, self.quiet = False, [], 0, 0
+        return done
+
+
+# ---------------------------------------------------------------------------
+# Speech to text: whisper.cpp
+# ---------------------------------------------------------------------------
+
+# whisper-server reports detected languages by full name ("italian").
+WHISPER_NAMES = {name.lower(): code for code, (name, *_rest) in LANGUAGES.items()}
+WHISPER_NAMES.update({"persian": "fa", "norwegian": "nb", "korean": "ko"})
+
+
+def lang_code(name):
+    """Whisper's language name or code -> the Argos code this tool uses."""
+    name = (name or "").strip().lower()
+    if len(name) == 2:
+        return FROM_WHISPER.get(name, name)
+    return WHISPER_NAMES.get(name, "")
+
+
+def _multipart(fields, files):
+    boundary = uuid.uuid4().hex
+    out = io.BytesIO()
+    for k, v in fields.items():
+        out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n"
+                  f"{v}\r\n".encode())
+    for k, (fname, data, ctype) in files.items():
+        out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; "
+                  f"filename=\"{fname}\"\r\nContent-Type: {ctype}\r\n\r\n".encode())
+        out.write(data)
+        out.write(b"\r\n")
+    out.write(f"--{boundary}--\r\n".encode())
+    return out.getvalue(), f"multipart/form-data; boundary={boundary}"
+
+
+class WhisperServerSTT:
+    """whisper.cpp's whisper-server on localhost keeps the model in RAM, so
+    each transmission skips the 1-2 s model load a Pi 4 would otherwise pay."""
+
+    def __init__(self, url, timeout=180):
+        self.url = url.rstrip("/") + "/inference"
+        self.timeout = timeout
+
+    def transcribe(self, audio16k, lang):
+        import urllib.request
+        auto = lang in ("", "auto", None)
+        # Plain "json" when the language is known: "verbose_json" makes the
+        # server run a second, expensive language-detection pass.
+        fields = {"response_format": "verbose_json" if auto else "json",
+                  "temperature": "0.0", "best_of": "1", "language": "auto" if auto else lang}
+        body, ctype = _multipart(fields, {"file": ("tx.wav", wav_bytes(audio16k, STT_RATE),
+                                                   "audio/wav")})
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if "error" in data:
+            raise RuntimeError(f"whisper-server: {data['error']}")
+        detected = lang_code(data.get("language", "")) if auto else lang
+        return clean_transcript(data.get("text", "")), detected or lang
+
+
+class WhisperCliSTT:
+    """Fallback: run whisper-cli per transmission (reloads the model each time)."""
+
+    def __init__(self, cli, model, threads=4):
+        self.cli, self.model, self.threads = cli, model, str(threads)
+
+    def transcribe(self, audio16k, lang):
+        with tempfile.TemporaryDirectory() as d:
+            wav = os.path.join(d, "tx.wav")
+            write_wav(wav, audio16k, STT_RATE)
+            base = os.path.join(d, "out")
+            run_tool([self.cli, "-m", self.model, "-f", wav, "-l", lang or "auto",
+                      "-t", self.threads, "-bs", "1", "-bo", "1", "-np", "-nt",
+                      "-oj", "-of", base])
+            with open(base + ".json", encoding="utf-8") as fh:
+                data = json.load(fh)
+        text = " ".join(s.get("text", "") for s in data.get("transcription", []))
+        detected = (data.get("result") or {}).get("language") or lang
+        return clean_transcript(text), detected
+
+
+def make_stt(conf):
+    if conf["STT"] == "cli":
+        return WhisperCliSTT(conf["WHISPER_CLI"], conf["WHISPER_MODEL"], conf["WHISPER_THREADS"])
+    return WhisperServerSTT(conf["WHISPER_URL"])
+
+
+# ---------------------------------------------------------------------------
+# Text to speech: Piper, run as its own process
+# ---------------------------------------------------------------------------
+
+class PiperTTS:
+    def __init__(self, piper, voices):
+        self.piper = piper
+        self.voices = voices        # lang -> .onnx path
+
+    def synth(self, text, lang):
+        model = self.voices.get(lang)
+        if not model:
+            raise RuntimeError(f"No Piper voice configured for '{lang}' (set VOICE_{lang.upper()}).")
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "say.wav")
+            # One line = one utterance; keep it to one so it lands in one WAV.
+            line = re.sub(r"\s+", " ", text).strip() + "\n"
+            run_tool([self.piper, "-m", model, "-f", out], input=line.encode("utf-8"))
+            return read_wav(out)
+
+
+class OpenJTalkTTS:
+    """Open JTalk: the offline Japanese voice (Piper has no Japanese voice).
+    Debian packages: open-jtalk, open-jtalk-mecab-naist-jdic, hts-voice-*."""
+
+    def __init__(self, voice, dic, binary="open_jtalk"):
+        self.voice, self.dic, self.binary = voice, dic, binary
+
+    def synth(self, text, lang):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "say.txt"), os.path.join(d, "say.wav")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write(re.sub(r"\s+", " ", text).strip() + "\n")
+            run_tool([self.binary, "-x", self.dic, "-m", self.voice, "-ow", out, src])
+            return read_wav(out)
+
+
+OPENJTALK = "openjtalk:"        # VOICE_JA=openjtalk:/path/to/voice.htsvoice
+
+
+class VoiceBank:
+    """Picks the engine per language: Piper .onnx voices, or Open JTalk."""
+
+    def __init__(self, piper, voices, dic=""):
+        self.piper, self.voices, self.dic = piper, voices, dic
+
+    def synth(self, text, lang):
+        v = self.voices.get(lang)
+        if not v:
+            raise RuntimeError(f"No voice configured for '{lang}' (set VOICE_{lang.upper()}).")
+        if v.startswith(OPENJTALK):
+            return OpenJTalkTTS(v[len(OPENJTALK):], self.dic).synth(text, lang)
+        return PiperTTS(self.piper, {lang: v}).synth(text, lang)
+
+
+def make_tts(conf):
+    voices = {k[6:].lower(): v for k, v in conf.items() if k.startswith("VOICE_") and v}
+    return VoiceBank(conf["PIPER"], voices, conf.get("OPENJTALK_DIC", ""))
+
+
+# ---------------------------------------------------------------------------
+# Radio PTT
+# ---------------------------------------------------------------------------
+
+class NullPTT:
+    name = "none"
+
+    def key(self, on):
+        pass
+
+    def close(self):
+        pass
+
+
+class RigctldPTT:
+    """Hamlib's rigctld (already part of RF Pi): 'T 1' keys, 'T 0' unkeys."""
+    name = "rigctld"
+
+    def __init__(self, hostport, timeout=3):
+        host, _, port = hostport.rpartition(":")
+        self.addr = (host or "127.0.0.1", int(port or 4532))
+        self.timeout = timeout
+
+    def _cmd(self, line):
+        with socket.create_connection(self.addr, timeout=self.timeout) as s:
+            s.sendall((line + "\n").encode())
+            reply = s.recv(256).decode(errors="replace").strip()
+        return reply
+
+    def key(self, on):
+        reply = self._cmd(f"T {1 if on else 0}")
+        if not reply.startswith("RPRT 0"):
+            raise RuntimeError(f"rigctld refused PTT: {reply or 'no reply'}")
+
+    def status(self):
+        return self._cmd("t")
+
+    def close(self):
+        pass
+
+
+class SerialPTT:
+    """RTS or DTR on a serial port (Digirig, most CAT/USB cables)."""
+
+    def __init__(self, port, line="rts"):
+        import serial
+        self.name = line
+        self.line = line
+        # Set both lines low BEFORE opening: a plain Serial(port) raises RTS
+        # and DTR as it opens, which would key the rig at start-up.
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.rts = False
+        self.ser.dtr = False
+        self.ser.open()
+
+    def key(self, on):
+        setattr(self.ser, self.line, bool(on))
+
+    def close(self):
+        self.key(False)
+        self.ser.close()
+
+
+class GpioPTT:
+    name = "gpio"
+
+    def __init__(self, pin):
+        from gpiozero import OutputDevice
+        self.dev = OutputDevice(int(pin), active_high=True, initial_value=False)
+
+    def key(self, on):
+        self.dev.value = bool(on)
+
+    def close(self):
+        self.dev.off()
+        self.dev.close()
+
+
+def make_ptt(conf):
+    kind = conf["PTT"].lower()
+    if kind == "rigctld":
+        return RigctldPTT(conf["RIGCTLD"])
+    if kind in ("rts", "dtr"):
+        return SerialPTT(conf["PTT_SERIAL"], kind)
+    if kind == "gpio":
+        return GpioPTT(conf["PTT_GPIO"])
+    return NullPTT()          # vox / none: the rig keys itself from the audio
+
+
+@contextmanager
+def keyed(ptt, lead_ms=300, tail_ms=200, max_s=None):
+    """Key the radio for the duration of the block. Always unkeys, even on
+    error or Ctrl-C. With max_s, a watchdog also unkeys after that many
+    seconds if the block is still running (a stalled sound device must not
+    hold the transmitter on)."""
+    def force_off():
+        print(f"\n!! Transmission exceeded {max_s:.0f} s: unkeying.", file=sys.stderr)
+        try:
+            ptt.key(False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"!! FAILED TO UNKEY via {ptt.name}: {exc} -- unkey the radio by hand",
+                  file=sys.stderr)
+
+    watchdog = threading.Timer(max_s, force_off) if max_s else None
+    if watchdog:
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        ptt.key(True)
+        time.sleep(lead_ms / 1000)
+        yield
+        time.sleep(tail_ms / 1000)
+    finally:
+        if watchdog:
+            watchdog.cancel()
+        try:
+            ptt.key(False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"!! FAILED TO UNKEY via {ptt.name}: {exc} -- unkey the radio by hand",
+                  file=sys.stderr)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Station identification (FCC 97.119: English, at the end of each contact
+# and at least every 10 minutes during it)
+# ---------------------------------------------------------------------------
+
+class IdTimer:
+    def __init__(self, every_min=10, margin_s=15, clock=time.monotonic):
+        self.every = every_min * 60
+        self.margin = margin_s
+        self.clock = clock
+        self.last = None            # last ID sent
+        self.since_id = False       # transmitted since the last ID?
+
+    def note_tx(self):
+        self.since_id = True
+
+    def due(self, duration=0.0):
+        """Should a transmission lasting `duration` seconds end with an ID?
+        True on the first one, and whenever it would otherwise finish past
+        the 10-minute mark (the ID goes at the end of the over)."""
+        if self.last is None:
+            return True
+        return self.clock() - self.last + duration >= self.every - self.margin
+
+    def mark(self):
+        self.last = self.clock()
+        self.since_id = False
+
+
+# ---------------------------------------------------------------------------
+# Local push-to-talk (operator -> Pi)
+# ---------------------------------------------------------------------------
+
+class KeyboardLocal:
+    """Enter starts talking, Enter again stops. Commands: i = send ID /
+    end contact, q = quit. Works over SSH and in the kiosk terminal."""
+
+    def __init__(self):
+        self.lines = queue.Queue()
+        self.eof = False
+        self._talking = False
+        self._released = threading.Event()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in sys.stdin:
+            self.lines.put(line.strip().lower())
+        self.eof = True
+        self.lines.put("q")
+
+    def wait_press(self):
+        print("\n[Enter] talk   [i Enter] send ID / end contact   [q Enter] quit")
+        cmd = self.lines.get()
+        if cmd in ("q", "quit", "exit"):
+            return "quit"
+        if cmd in ("i", "id"):
+            return "id"
+        self._released.clear()
+        self._talking = True
+        print("● Talking... press Enter when done.")
+
+        def wait_release():
+            line = self.lines.get()
+            if self._talking:
+                self._released.set()
+            else:                       # recording already ended (time limit):
+                self.lines.put(line)    # this Enter belongs to the next prompt
+        threading.Thread(target=wait_release, daemon=True).start()
+        return "talk"
+
+    def is_down(self):
+        return not self._released.is_set()
+
+    def end_talk(self):
+        self._talking = False
+
+    def confirm(self, timeout, what="Send it?"):
+        """True only for a deliberate yes typed AFTER the prompt appears:
+        Enter, y or yes. Anything else, or no answer in time, is a no."""
+        while True:                     # keys pressed before the prompt don't count
+            try:
+                self.lines.get_nowait()
+            except queue.Empty:
+                break
+        if self.eof:
+            return False
+        print(f"{what} [Enter] transmit   [n Enter] discard   ({int(timeout)} s)")
+        try:
+            ans = self.lines.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        return ans in ("", "y", "yes") and not self.eof
+
+
+class GpioLocal:
+    """Footswitch / button to GND on LOCAL_PTT_GPIO: hold to talk. In review
+    a short tap sends, a hold of 1.5 s or more discards."""
+
+    def __init__(self, pin, id_pin=""):
+        from gpiozero import Button
+        self.btn = Button(int(pin), pull_up=True, bounce_time=0.03)
+        self.id_btn = Button(int(id_pin), pull_up=True, bounce_time=0.03) if id_pin else None
+        self._id = threading.Event()
+        if self.id_btn:
+            self.id_btn.when_pressed = self._id.set
+
+    def wait_press(self):
+        print("\n(hold the footswitch to talk)")
+        self._id.clear()                # an ID press made mid-over doesn't key later
+        while True:
+            if self._id.is_set():
+                self._id.clear()
+                return "id"
+            if self.btn.wait_for_press(timeout=0.2):
+                print("● Talking...")
+                return "talk"
+
+    def is_down(self):
+        return self.btn.is_pressed
+
+    def end_talk(self):
+        pass
+
+    def confirm(self, timeout, what="Send it?"):
+        # Still held from the recording? That press must not count as "send".
+        if self.btn.is_pressed and not self.btn.wait_for_release(timeout=timeout):
+            return False
+        print(f"{what} Tap the footswitch to transmit, hold 1.5 s to discard "
+              f"({int(timeout)} s).")
+        if not self.btn.wait_for_press(timeout=timeout):
+            return False
+        t0 = time.monotonic()
+        self.btn.wait_for_release(timeout=5)
+        return time.monotonic() - t0 < 1.5
+
+
+def make_local(conf):
+    if conf["LOCAL_PTT"].lower() == "gpio":
+        return GpioLocal(conf["LOCAL_PTT_GPIO"], conf.get("ID_GPIO", ""))
+    return KeyboardLocal()
+
+
+# ---------------------------------------------------------------------------
+# Sound devices (sounddevice / PortAudio)
+# ---------------------------------------------------------------------------
+
+def _sd():
+    try:
+        import sounddevice
+    except (ImportError, OSError) as exc:
+        sys.exit(f"sounddevice/PortAudio not available ({exc}). Run: sudo rfpi-translator-install")
+    return sounddevice
+
+
+def find_device(spec, kind):
+    """'default', an index, or a case-insensitive name substring."""
+    sd = _sd()
+    if spec in ("", "default"):
+        return None
+    if str(spec).isdigit():
+        return int(spec)
+    want = "max_input_channels" if kind == "input" else "max_output_channels"
+    for i, d in enumerate(sd.query_devices()):
+        if spec.lower() in d["name"].lower() and d[want] > 0:
+            return i
+    raise RuntimeError(f"No {kind} audio device matching '{spec}'. See: hampi-translate devices")
+
+
+def device_rate(dev, kind):
+    sd = _sd()
+    return int(sd.query_devices(dev, kind)["default_samplerate"])
+
+
+def record_while(dev, is_down, max_s):
+    sd = _sd()
+    np = _np()
+    rate = device_rate(dev, "input")
+    chunks = []
+    with sd.InputStream(device=dev, channels=1, samplerate=rate, dtype="float32",
+                        callback=lambda data, *_: chunks.append(data.copy())):
+        t0 = time.monotonic()
+        while is_down() and time.monotonic() - t0 < max_s:
+            time.sleep(0.02)
+        if time.monotonic() - t0 >= max_s:
+            print(f"(recording stopped at the {max_s:.0f} s limit)")
+    audio = np.concatenate(chunks)[:, 0] if chunks else np.zeros(0, dtype=np.float32)
+    return resample(audio, rate, STT_RATE)
+
+
+def play(audio, rate, dev, gain=1.0, stop=None):
+    """Play and wait. Each call opens its own stream: sounddevice's shared
+    sd.play() stops whatever another thread is playing, which would let a
+    receive playback cut off a transmission. `stop` (an Event) ends it early."""
+    sd = _sd()
+    np = _np()
+    out_rate = device_rate(dev, "output")
+    x = np.ascontiguousarray((resample(audio, rate, out_rate) * float(gain))
+                             .astype(np.float32).reshape(-1, 1))
+    block = max(1, out_rate // 10)
+    with sd.OutputStream(device=dev, channels=1, samplerate=out_rate, dtype="float32") as out:
+        for i in range(0, len(x), block):
+            if stop is not None and stop.is_set():
+                out.abort()
+                return
+            out.write(x[i:i + block])
+        out.stop()                      # waits until the last buffer has played
+
+
+# ---------------------------------------------------------------------------
+# The translator itself
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Result:
+    heard: str = ""
+    lang: str = ""
+    translation: Translation = None
+    audio: object = None
+    rate: int = 0
+    timings: dict = field(default_factory=dict)
+
+
+class Engine:
+    """STT -> jargon-safe translation -> TTS. Components are injectable so the
+    whole chain can be tested without models or sound hardware."""
+
+    def __init__(self, conf, stt=None, translator=None, tts=None):
+        self.conf = conf
+        self.stt = stt or make_stt(conf)
+        self.translator = translator or PhraseTranslator(
+            PackBackend(conf.get("ARGOS_DIR", ARGOS_DIR), conf.get("TRANSLATE_BEAM", 2),
+                        conf.get("WHISPER_THREADS", 4)),
+            load_glossary(conf.get("GLOSSARY", "")))
+        self.tts = tts or make_tts(conf)
+
+    def translate_audio(self, audio16k, src, dst, speak=True, disclose=False):
+        r = Result()
+        t = time.monotonic()
+        r.heard, r.lang = self.stt.transcribe(audio16k, whisper_code(src))
+        r.lang = lang_code(r.lang) or r.lang
+        r.timings["stt"] = time.monotonic() - t
+        if not r.heard:
+            return r
+        src = r.lang if src in ("", "auto") else src
+        self._finish(r, r.heard, src, dst, speak, disclose)
+        return r
+
+    def translate_text(self, text, src, dst, speak=True, disclose=False):
+        r = Result(heard=text, lang=src)
+        self._finish(r, text, src, dst, speak, disclose)
+        return r
+
+    def _finish(self, r, text, src, dst, speak, disclose):
+        t = time.monotonic()
+        r.translation = self.translator.translate(text, src, dst)
+        r.timings["translate"] = time.monotonic() - t
+        if speak:
+            t = time.monotonic()
+            spoken = r.translation.spoken
+            if disclose and dst in DISCLOSURE:
+                spoken = f"{DISCLOSURE[dst]} {spoken}"
+            r.audio, r.rate = self.tts.synth(spoken, dst)
+            r.timings["tts"] = time.monotonic() - t
+
+    def id_audio(self):
+        call = self.conf["CALLSIGN"]
+        if self.conf.get("ID_WAV") and os.path.exists(self.conf["ID_WAV"]):
+            return read_wav(self.conf["ID_WAV"])
+        return self.tts.synth(f"This is {phonetic(call)}.", "en")
+
+
+class Status:
+    """Small JSON file other RF Pi tools (e.g. a dashboard widget) can read."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = {"state": "starting", "log": []}
+        self._lock = threading.Lock()       # written from the TX and RX threads
+
+    def set(self, state=None, **kw):
+        """Set the state (None keeps it) and write the file."""
+        with self._lock:
+            if state is not None:
+                self.data["state"] = state
+                if state != "review":
+                    self.data.pop("pending", None)
+            self.data.update(kw)
+            self.data["updated"] = time.time()
+            if not self.path:
+                return
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(self.data, fh)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+    def log(self, direction, original, translated):
+        with self._lock:
+            self.data["log"] = (self.data["log"] + [{"t": time.time(), "dir": direction,
+                                                     "heard": original,
+                                                     "text": translated}])[-30:]
+        self.set()
+
+
+def _fmt_t(t):
+    return "  ".join(f"{k} {v:.1f}s" for k, v in t.items())
+
+
+def _callsign_ok(call):
+    return bool(CALL_RE.fullmatch(call or "")) and call.upper() != "N0CALL"
+
+
+def cmd_run(conf, args):
+    my, their = conf["MY_LANG"], conf["THEIR_LANG"]
+    rx_lang = conf["RX_LANG"] or their
+    no_tx = args.no_tx
+    if not no_tx and not _callsign_ok(conf["CALLSIGN"]):
+        sys.exit("Set CALLSIGN in /etc/hampi/station.conf before transmitting "
+                 "(or use --no-tx to practise).")
+    engine = Engine(conf)
+    status = Status(conf.get("STATUS_FILE"))
+    op_in = find_device(conf["OPERATOR_IN"], "input")
+    op_out = find_device(conf["OPERATOR_OUT"], "output")
+    radio_out = op_out if no_tx else find_device(conf["RADIO_OUT"], "output")
+    ptt = NullPTT() if no_tx else make_ptt(conf)
+    local = make_local(conf)
+    ids = IdTimer(int(conf["ID_EVERY_MIN"]))
+    muted = threading.Event()
+    cpu = threading.Lock()          # one translation at a time: a Pi 4 has 4 cores, not 8
+
+    print(f"RF Pi translator  {my} -> {their} on transmit, {rx_lang} -> {my} on receive")
+    print(f"Station {conf['CALLSIGN']}  PTT: {'(practice, radio not keyed)' if no_tx else ptt.name}")
+    print("Loading models...")
+    t = time.monotonic()
+    engine.translate_text("Good morning.", my, their, speak=True)
+    engine.translate_text("Buongiorno." if their == "it" else "Hello.", their, my, speak=False)
+    print(f"Ready ({time.monotonic() - t:.1f} s warm-up).")
+    status.set("idle")
+
+    if flag(conf, "RX") and not no_tx:
+        threading.Thread(target=_rx_loop, args=(conf, engine, status, muted, cpu, rx_lang,
+                                                my, op_out), daemon=True).start()
+
+    def send_id():
+        _transmit(conf, ptt, radio_out, muted, [], status, id_part=engine.id_audio())
+        ids.mark()
+        print(f"ID sent: {conf['CALLSIGN']}")
+
+    def one_over():
+        status.set("recording")
+        audio = record_while(op_in, local.is_down, float(conf["MAX_RECORD_SEC"]))
+        local.end_talk()
+        released = time.monotonic()
+        if len(audio) < STT_RATE * 0.4:
+            print("(too short, ignored)")
+            return
+        status.set("processing")
+        with cpu:
+            r = engine.translate_audio(audio, my, their, speak=True,
+                                       disclose=flag(conf, "DISCLOSE"))
+        if not r.heard:
+            print("(no speech recognised)")
+            return
+        print(f"\nYou said : {r.heard}")
+        print(f"Sending  : {r.translation.display}"
+              + ("   [jargon spliced: check it]" if r.translation.fallback else ""))
+        print(f"           ({_fmt_t(r.timings)})")
+        status.log("tx", r.heard, r.translation.display)
+        if flag(conf, "REVIEW"):
+            status.set("review", pending=r.translation.display)
+            if not local.confirm(float(conf["REVIEW_TIMEOUT"])):
+                print("Discarded, nothing sent.")
+                return
+        # Decide on the ID after the review wait, counting this over's length.
+        with_id = ids.due(len(r.audio) / r.rate + 5)
+        dead_air = time.monotonic() - released
+        _transmit(conf, ptt, radio_out, muted, [(r.audio, r.rate)], status,
+                  id_part=engine.id_audio() if with_id else None)
+        ids.note_tx()
+        if with_id:
+            ids.mark()
+        if not flag(conf, "REVIEW"):
+            print(f"Dead air before key-up: {dead_air:.1f} s")
+
+    # A dropped SSH session (SIGHUP) or `kill` (SIGTERM) must unkey too: turn
+    # them into a normal exit so the finally blocks run.
+    def on_signal(signum, _frame):
+        raise SystemExit(f"stopped by signal {signum}")
+    old_handlers = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            old_handlers[sig] = signal.signal(sig, on_signal)
+        except (ValueError, OSError):       # not the main thread
+            pass
+
+    try:
+        while True:
+            cmd = local.wait_press()
+            try:
+                if cmd == "quit":
+                    # 97.119: ID at the end of the contact. Still needs a press.
+                    if (ids.since_id and not no_tx
+                            and local.confirm(float(conf["REVIEW_TIMEOUT"]),
+                                              f"Send your ID ({conf['CALLSIGN']}) to end "
+                                              "the contact?")):
+                        send_id()
+                    break
+                if cmd == "id":
+                    send_id()
+                else:
+                    one_over()
+            except Exception as exc:  # noqa: BLE001 - one bad over must not end the QSO
+                print(f"\n!! {type(exc).__name__}: {exc}\n   Nothing more was sent. "
+                      "Try that over again.", file=sys.stderr)
+            status.set("idle")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            ptt.key(False)          # belt and braces: never leave the rig keyed
+            ptt.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"!! Could not confirm unkey via {ptt.name}: {exc} -- check the radio",
+                  file=sys.stderr)
+        status.set("stopped")
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        if ids.since_id and not no_tx:
+            print(f"Reminder: you have not identified since your last transmission. Give "
+                  f"your callsign ({conf['CALLSIGN']}) on the rig mic to end the contact "
+                  "(97.119).")
+
+
+def _transmit(conf, ptt, dev, muted, parts, status, id_part=None):
+    """Play the (audio, rate) parts, then the station ID if given, with the
+    radio keyed once. The message is trimmed to fit MAX_TX_SEC; the ID never is."""
+    rate = 22050
+    lead, tail = int(conf["PTT_LEAD_MS"]), int(conf["PTT_TAIL_MS"])
+    cap = float(conf["MAX_TX_SEC"])
+    ident = resample(*id_part, rate) if id_part else None
+    audio = join_audio([resample(a, r, rate) for a, r in parts], rate)
+    room = cap - (len(ident) / rate + 0.25 if ident is not None else 0)
+    if len(audio) > room * rate:
+        print(f"(message cut to fit the {cap:.0f} s MAX_TX_SEC limit)")
+        audio = audio[:max(0, int(room * rate))]
+    audio = join_audio([audio, ident], rate)
+    muted.set()
+    status.set("transmitting")
+    try:
+        # The watchdog bounds keyed time even if the sound device stalls.
+        with keyed(ptt, lead, tail, max_s=len(audio) / rate + (lead + tail) / 1000 + 5):
+            play(audio, rate, dev, gain=float(conf["RADIO_GAIN"]))
+    finally:
+        time.sleep(0.3)             # let the rig's own receive recovery pass
+        muted.clear()
+
+
+def _rx_loop(conf, engine, status, muted, cpu, rx_lang, my, op_out):
+    try:
+        _rx_listen(conf, engine, status, muted, cpu, rx_lang, my, op_out)
+    except BaseException as exc:  # noqa: BLE001 - say so; don't die silently
+        print(f"\n!! Receive translation stopped: {exc}\n   Transmit still works. "
+              "Check RADIO_IN (hampi-translate devices).", file=sys.stderr)
+
+
+def _rx_listen(conf, engine, status, muted, cpu, rx_lang, my, op_out):
+    sd = _sd()
+    dev = find_device(conf["RADIO_IN"], "input")
+    rate = device_rate(dev, "input")
+    seg = Segmenter(rate, float(conf["RX_THRESHOLD_DB"]), int(conf["RX_HANG_MS"]),
+                    int(conf["RX_MIN_MS"]))
+    blocks = queue.Queue()
+
+    def capture(data, *_):
+        if not muted.is_set():          # drop our own transmission at the source
+            blocks.put(data[:, 0].copy())
+
+    with sd.InputStream(device=dev, channels=1, samplerate=rate, dtype="float32",
+                        blocksize=int(rate * 0.05), callback=capture):
+        while True:
+            block = blocks.get()
+            if muted.is_set():
+                seg.reset()
+                continue
+            for s in seg.feed(block):
+                try:
+                    with cpu:
+                        r = engine.translate_audio(resample(s, rate, STT_RATE),
+                                                   "" if rx_lang == "auto" else rx_lang, my,
+                                                   speak=True)
+                    if not r.heard:
+                        continue
+                    print(f"\n◀ Heard   : {r.heard}  [{r.lang}]")
+                    print(f"◀ Meaning : {r.translation.display}   ({_fmt_t(r.timings)})")
+                    status.log("rx", r.heard, r.translation.display)
+                    # Text is on screen either way; don't talk over a transmission.
+                    play(r.audio, r.rate, op_out, stop=muted)
+                except Exception as exc:  # noqa: BLE001 - keep listening
+                    print(f"\n◀ (receive error, still listening: {exc})", file=sys.stderr)
+
+
+def cmd_text(conf, args):
+    src, dst = _direction(conf, args)
+    engine = Engine(conf, stt=_NoSTT())
+    speak = bool(args.speak or args.out)
+    r = engine.translate_text(args.text, src, dst, speak=speak)
+    print(r.translation.display)
+    if r.translation.spoken != r.translation.display:
+        print(f"(spoken: {r.translation.spoken})")
+    print(f"({_fmt_t(r.timings)})", file=sys.stderr)
+    if args.out:
+        write_wav(args.out, r.audio, r.rate)
+    elif args.speak:
+        play(r.audio, r.rate, find_device(conf["OPERATOR_OUT"], "output"))
+
+
+def cmd_file(conf, args):
+    src, dst = _direction(conf, args)
+    audio, rate = read_wav(args.wav)
+    engine = Engine(conf)
+    r = engine.translate_audio(resample(audio, rate, STT_RATE), src, dst, speak=bool(args.out))
+    if not r.heard:
+        sys.exit("No speech recognised.")
+    print(f"Heard      : {r.heard}  [{r.lang}]")
+    print(f"Translation: {r.translation.display}")
+    print(f"({_fmt_t(r.timings)})")
+    if args.out:
+        write_wav(args.out, r.audio, r.rate)
+
+
+def _direction(conf, args):
+    src, dst = conf["MY_LANG"], conf["THEIR_LANG"]
+    if getattr(args, "rx", False):
+        src, dst = dst, src
+    return args.src or src, args.dst or dst
+
+
+class _NoSTT:
+    def transcribe(self, audio, lang):
+        raise RuntimeError("speech-to-text not needed for this command")
+
+
+def _board():
+    try:
+        with open("/proc/device-tree/model") as fh:
+            return fh.read().strip("\x00\n")
+    except OSError:
+        return "unknown board"
+
+
+def _cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as fh:
+            return f"{int(fh.read()) / 1000:.0f} °C"
+    except (OSError, ValueError):
+        return "n/a"
+
+
+def _throttled():
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True,
+                             timeout=3).stdout.strip()
+        return out.split("=")[-1] or "n/a"
+    except (OSError, subprocess.SubprocessError):
+        return "n/a"
+
+
+def cmd_bench(conf, args):
+    my, their = conf["MY_LANG"], conf["THEIR_LANG"]
+    engine = Engine(conf)
+    runs = max(1, args.runs)
+    sentence = ("Good morning, this is a test of the offline translator. "
+                "Your signal is five nine and my QTH is the shack.")
+    if args.wav:
+        audio, rate = read_wav(args.wav)
+        audio = resample(audio, rate, STT_RATE)
+    else:
+        a, rate = engine.tts.synth(sentence, my)
+        audio = resample(a, rate, STT_RATE)
+    secs = len(audio) / STT_RATE
+    print(f"{_board()}  ·  CPU {_cpu_temp()}  ·  throttled={_throttled()}")
+    print(f"Test audio: {secs:.1f} s of speech, {runs} timed run(s) after one warm-up\n")
+    engine.translate_audio(audio, my, their, speak=True)            # warm-up
+    times = {"stt": [], "translate": [], "tts": []}
+    r = None
+    for _ in range(runs):
+        r = engine.translate_audio(audio, my, their, speak=True)
+        for k in times:
+            times[k].append(r.timings.get(k, 0.0))
+    print(f"{'stage':<12}{'median':>8}{'x real time':>14}")
+    total = 0.0
+    for k, v in times.items():
+        m = statistics.median(v)
+        total += m
+        print(f"{k:<12}{m:>7.2f}s{m / secs:>13.2f}x")
+    print(f"{'dead air':<12}{total:>7.2f}s   (release -> key-up, excluding PTT lead)")
+    if r and r.translation:
+        print(f"\nHeard:      {r.heard}\nTranslated: {r.translation.display}")
+    print(f"\nCPU after: {_cpu_temp()}  ·  throttled={_throttled()} (0x0 = never throttled)")
+    print("Power: read a USB-C inline meter during the runs; the Pi can't measure its own draw.")
+
+
+def cmd_devices(conf, args):
+    print(_sd().query_devices())
+
+
+def cmd_fetch(conf, args):
+    fetch_packs(conf["MY_LANG"], args.langs or [conf["THEIR_LANG"]], conf["ARGOS_DIR"])
+
+
+def cmd_check(conf, args):
+    ok = True
+
+    def line(good, what, detail=""):
+        nonlocal ok
+        ok &= bool(good)
+        print(f"  [{'OK' if good else '!!'}] {what}" + (f"  {detail}" if detail else ""))
+
+    print(f"{_board()}  ·  {conf['MY_LANG']} <-> {conf['THEIR_LANG']}")
+    line(_callsign_ok(conf["CALLSIGN"]), "Callsign", conf["CALLSIGN"]
+         + ("" if _callsign_ok(conf["CALLSIGN"]) else " -> edit /etc/hampi/station.conf"))
+    try:
+        import numpy  # noqa: F401
+        line(True, "numpy")
+    except ImportError:
+        line(False, "numpy", "-> sudo rfpi-translator-install")
+    if conf["STT"] == "cli":
+        line(os.path.exists(conf["WHISPER_CLI"]), "whisper-cli", conf["WHISPER_CLI"])
+        line(os.path.exists(conf["WHISPER_MODEL"]), "Whisper model", conf["WHISPER_MODEL"])
+    else:
+        try:
+            import urllib.request
+            urllib.request.urlopen(conf["WHISPER_URL"], timeout=3).close()
+            line(True, "whisper-server", conf["WHISPER_URL"])
+        except Exception as exc:  # noqa: BLE001
+            code = getattr(exc, "code", None)
+            line(code is not None, "whisper-server", conf["WHISPER_URL"] + (
+                "" if code is not None else " -> sudo systemctl start hampi-whisper"))
+    try:
+        import ctranslate2  # noqa: F401
+        import sentencepiece  # noqa: F401
+        line(True, "CTranslate2 + SentencePiece")
+    except ImportError:
+        line(False, "CTranslate2 + SentencePiece", "-> sudo rfpi-translator-install")
+    packs = find_packs(conf.get("ARGOS_DIR", ARGOS_DIR))
+    for a, b in ((conf["MY_LANG"], conf["THEIR_LANG"]), (conf["THEIR_LANG"], conf["MY_LANG"])):
+        pack = packs.get((a, b))
+        line(pack is not None, f"Translation pack {a}->{b}",
+             pack[0] if pack else f"installed: {sorted(packs) or 'none'} "
+             f"-> sudo rfpi-translator-install --langs {conf['THEIR_LANG']}")
+    line(os.path.exists(conf["PIPER"]), "Piper", conf["PIPER"])
+    for lang in sorted({conf["MY_LANG"], conf["THEIR_LANG"], "en"}):
+        v = voice_for(conf, lang)
+        path = v[len(OPENJTALK):] if v.startswith(OPENJTALK) else v
+        line(bool(v) and os.path.exists(path), f"Voice {lang}", v or f"set VOICE_{lang.upper()}")
+        if v.startswith(OPENJTALK):
+            line(os.path.isdir(conf["OPENJTALK_DIC"]), "Open JTalk dictionary", conf["OPENJTALK_DIC"])
+    unknown = sorted({conf["MY_LANG"], conf["THEIR_LANG"]} - set(LANGUAGES))
+    if unknown:
+        print(f"  [--] Not a tested language: {', '.join(unknown)} (no spoken disclosure; "
+              f"see TRANSLATOR.md for the supported list)")
+    for key, kind in (("OPERATOR_IN", "input"), ("OPERATOR_OUT", "output"),
+                      ("RADIO_IN", "input"), ("RADIO_OUT", "output")):
+        try:
+            find_device(conf[key], kind)
+            line(True, f"Audio {key}", conf[key])
+        except (RuntimeError, SystemExit) as exc:
+            line(False, f"Audio {key}", str(exc))
+    if conf["PTT"].lower() == "rigctld":
+        try:
+            st = RigctldPTT(conf["RIGCTLD"]).status().strip()
+            line(st in ("0", "1"), "rigctld PTT", f"{conf['RIGCTLD']} (PTT state {st})" + (
+                "" if st in ("0", "1") else
+                " -> rigctld can't key this rig: start it with -P RIG (CAT PTT) "
+                "or -P RTS -p /dev/ttyUSB0"))
+        except OSError as exc:
+            line(False, "rigctld PTT", f"{exc} -> start it: rigctld -m <model> -r /dev/ttyUSB0 -P RIG &")
+    else:
+        line(True, "PTT", conf["PTT"])
+    print("\nAll set." if ok else "\nFix the !! lines, then run: hampi-translate check")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    # Models and Python deps live in their own venv; re-run inside it.
+    if (os.path.exists(VENV_PY) and not os.environ.get("HAMPI_TRANSLATE_IN_VENV")
+            and os.path.realpath(sys.prefix) != os.path.realpath(os.path.dirname(os.path.dirname(VENV_PY)))):
+        os.environ["HAMPI_TRANSLATE_IN_VENV"] = "1"
+        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + argv)
+
+    p = argparse.ArgumentParser(prog="hampi-translate", description=__doc__.split("\n\n")[0])
+    p.add_argument("--conf", help="config file (default /etc/hampi/translate.conf)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check", help="verify models, audio devices and PTT")
+    r = sub.add_parser("run", help="operate the translator")
+    r.add_argument("--no-tx", action="store_true",
+                   help="practice mode: never key the radio, play to headphones")
+    for name, help_ in (("text", "translate typed text"), ("file", "translate a WAV recording")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("text" if name == "text" else "wav")
+        s.add_argument("--rx", action="store_true", help="their language -> mine")
+        s.add_argument("--from", dest="src", help="source language code (default MY_LANG)")
+        s.add_argument("--to", dest="dst", help="target language code (default THEIR_LANG)")
+        s.add_argument("--out", help="write the spoken translation to this WAV")
+        if name == "text":
+            s.add_argument("--speak", action="store_true", help="play it on OPERATOR_OUT")
+    b = sub.add_parser("bench", help="time each stage on this board")
+    b.add_argument("wav", nargs="?", help="WAV of you talking, e.g. a 10 s over (default: synthetic)")
+    b.add_argument("--runs", type=int, default=3, help="timed runs (default 3)")
+    sub.add_parser("devices", help="list audio devices")
+    f = sub.add_parser("fetch-packs", help="download translation packs (needs internet once)")
+    f.add_argument("--langs", nargs="+", help="partner languages (default THEIR_LANG)")
+    args = p.parse_args(argv)
+    conf = load_conf(args.conf)
+    handler = {"check": cmd_check, "run": cmd_run, "text": cmd_text, "file": cmd_file,
+               "bench": cmd_bench, "devices": cmd_devices, "fetch-packs": cmd_fetch}[args.cmd]
+    try:
+        return handler(conf, args) or 0
+    except (RuntimeError, OSError) as exc:      # OSError covers network/device failures
+        sys.exit(f"error: {exc}")
+    except ImportError as exc:
+        sys.exit(f"error: {exc}. Run: sudo rfpi-translator-install")
+    except ValueError as exc:
+        sys.exit(f"error: bad value in {args.conf or CONF_PATH}: {exc}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

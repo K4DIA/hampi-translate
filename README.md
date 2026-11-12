@@ -51,7 +51,9 @@ estimates.
 MIT. See [LICENSE](LICENSE). The concept is David P. Eisenhardt, Jr.'s
 (W4DPE); the build is Tony Pelfanio's (K4DIA). The engines and models it
 drives are separate works under their own licenses, described in the guide
-under "Where the models came from".
+under "Where the models came from". The MIT license covers this project's own
+code and documents, not those engines and models. On the air, you are the
+control operator and your regulator's rules apply.
 
 ## Review and problems
 
